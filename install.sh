@@ -70,7 +70,25 @@ if [ -z "$SKIP_CONFIG" ]; then
         WORKSTATION_KEY="${input:-$HOME/.ssh/id_ed25519}"
     fi
 
-    # Write config
+    echo ""
+    echo "── SLURM job (optional) ──"
+    echo "Path to the sbatch script on the HPC login node."
+    echo "Used by hpc-reconnect to auto-submit jobs."
+    read -rp "SLURM job script path (blank to skip): " SLURM_JOB_SCRIPT
+
+    echo ""
+    echo "── EduVPN auto-auth (optional) ──"
+    echo "If your HPC requires EduVPN, hpc-reconnect can auto-authenticate."
+    read -rp "Enable EduVPN automation? [y/N] " vpn_auto
+    EDUVPN_ENABLED=""
+    if [[ "$vpn_auto" =~ ^[Yy] ]]; then
+        EDUVPN_ENABLED=1
+        read -rp "IdP username: " IDP_USER
+        read -rsp "IdP password: " IDP_PASS
+        echo ""
+    fi
+
+    # Write config (no secrets here)
     mkdir -p "$(dirname "$CONF")"
     cat > "$CONF" <<EOF
 # SupercomputerReconnect config
@@ -82,6 +100,7 @@ HPC_KEY=$HPC_KEY
 WORKSTATION=${WORKSTATION:-}
 WORKSTATION_USER=${WORKSTATION_USER:-}
 WORKSTATION_KEY=${WORKSTATION_KEY:-}
+SLURM_JOB_SCRIPT=${SLURM_JOB_SCRIPT:-}
 LLM_PORT=$LLM_PORT
 ASR_PORT=$ASR_PORT
 TTS_PORT=$TTS_PORT
@@ -91,6 +110,18 @@ HPC_TTS_PORT=$HPC_TTS_PORT
 EOF
     echo ""
     echo "Config written to $CONF"
+
+    # Write secrets to separate env file (never committed)
+    if [ -n "$EDUVPN_ENABLED" ]; then
+        ENV_FILE="$HOME/.config/hpc-tunnel.env"
+        cat > "$ENV_FILE" <<EOF
+# Credentials for hpc-reconnect (NEVER commit this file)
+IDP_USER=$IDP_USER
+IDP_PASS=$IDP_PASS
+EOF
+        chmod 600 "$ENV_FILE"
+        echo "Credentials written to $ENV_FILE (mode 600)"
+    fi
 fi
 
 source "$CONF"
@@ -99,13 +130,20 @@ source "$CONF"
 
 mkdir -p "$BIN_DIR" "$SYSTEMD_DIR"
 
+SHARE_DIR="$HOME/.local/share/hpc-reconnect"
+mkdir -p "$SHARE_DIR"
+
 install -m 755 "$SCRIPT_DIR/hpc-node" "$BIN_DIR/hpc-node"
+install -m 755 "$SCRIPT_DIR/hpc-reconnect" "$BIN_DIR/hpc-reconnect"
 install -m 755 "$SCRIPT_DIR/hpc-tunnel-forward.sh" "$BIN_DIR/hpc-tunnel-forward.sh"
+install -m 644 "$SCRIPT_DIR/eduvpn-auth.js" "$SHARE_DIR/eduvpn-auth.js"
 
 echo ""
 echo "Installed:"
 echo "  $BIN_DIR/hpc-node"
+echo "  $BIN_DIR/hpc-reconnect"
 echo "  $BIN_DIR/hpc-tunnel-forward.sh"
+echo "  $SHARE_DIR/eduvpn-auth.js"
 
 # Forward tunnel service (always installed)
 cp "$SCRIPT_DIR/hpc-tunnel-forward.service" "$SYSTEMD_DIR/"
@@ -167,11 +205,24 @@ if ! echo "$PATH" | grep -q "$BIN_DIR"; then
     echo "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
 fi
 
+# ─── Install Playwright browser (for EduVPN auth) ───────────
+
+if command -v npx &>/dev/null; then
+    echo ""
+    echo "── Installing Playwright Chromium (for EduVPN auth) ──"
+    npx playwright install chromium 2>&1 | tail -2
+else
+    echo ""
+    echo "NOTE: npx not found. Install Node.js for EduVPN browser automation."
+    echo "  sudo apt install nodejs npm"
+fi
+
 echo ""
 echo "========================================="
-echo "  Done! Usage:"
-echo "    hpc-node               — show current node"
-echo "    hpc-node <node>        — switch to new node"
-echo "    hpc-node --auto        — auto-detect from SLURM"
-echo "    hpc-node --stop        — stop tunnels"
+echo "  Done! Commands:"
+echo "    hpc-reconnect           — full pipeline (VPN → job → tunnels)"
+echo "    hpc-node                — show current node"
+echo "    hpc-node <node>         — switch to new node"
+echo "    hpc-node --auto         — auto-detect from SLURM"
+echo "    hpc-node --stop         — stop tunnels"
 echo "========================================="
