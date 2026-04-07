@@ -1,0 +1,448 @@
+#!/bin/bash
+# hpc-connect — Connect to a workstation/gateway that exposes HPC AI services
+# For worker agents, laptops, or any machine that wants "local" AI.
+#
+# First run: generates SSH key, helps you add it to the target, tests connection.
+# Then: creates a persistent SSH tunnel so AI services appear on localhost.
+#
+# Usage:
+#   hpc-connect                     Interactive setup + connect
+#   hpc-connect <host>              Connect to a configured host
+#   hpc-connect --setup <host>      First-time setup for a host
+#   hpc-connect --status            Show tunnel status
+#   hpc-connect --stop              Stop tunnel
+#   hpc-connect --list              List configured hosts
+
+set -o pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+CONNECT_DIR="$HOME/.config/hpc-connect"
+SYSTEMD_DIR="$HOME/.config/systemd/user"
+
+ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
+fail() { echo -e "  ${RED}✗${NC} $1"; }
+warn() { echo -e "  ${YELLOW}!${NC} $1"; }
+info() { echo -e "  ${CYAN}→${NC} $1"; }
+
+mkdir -p "$CONNECT_DIR" "$SYSTEMD_DIR"
+
+# ─── First-time setup for a host ─────────────────────────────
+setup_host() {
+    local HOST_ALIAS="$1"
+
+    echo -e "\n${CYAN}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}  ${BOLD}hpc-connect${NC} — Connect to AI Services             ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
+
+    if [ -z "$HOST_ALIAS" ]; then
+        echo ""
+        echo -e "  ${DIM}Connect to a workstation or gateway that has HPC AI${NC}"
+        echo -e "  ${DIM}services tunneled to it. Your worker agents will get${NC}"
+        echo -e "  ${DIM}the same services on localhost.${NC}"
+        echo ""
+        echo -en "  ${BOLD}?${NC} Name for this connection (e.g. 'lab', 'workstation'): "
+        read -r HOST_ALIAS
+        [ -z "$HOST_ALIAS" ] && HOST_ALIAS="workstation"
+    fi
+
+    local CONF_FILE="$CONNECT_DIR/${HOST_ALIAS}.conf"
+
+    echo ""
+    echo -e "${BOLD}Step 1: Target Host${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    echo -en "  ${BOLD}?${NC} Hostname or IP: "
+    read -r TARGET_HOST
+
+    echo -en "  ${BOLD}?${NC} SSH user: "
+    read -r TARGET_USER
+
+    echo -en "  ${BOLD}?${NC} SSH port [22]: "
+    read -r input; TARGET_PORT="${input:-22}"
+
+    echo -en "  ${BOLD}?${NC} SSH ProxyCommand (blank for direct, e.g. 'cloudflared access ssh --hostname %h'): "
+    read -r TARGET_PROXY
+
+    # ─── SSH Key ─────────────────────────────────────────────
+    echo ""
+    echo -e "${BOLD}Step 2: SSH Key${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    local KEY_PATH="$HOME/.ssh/hpc-connect-${HOST_ALIAS}"
+
+    if [ -f "$KEY_PATH" ]; then
+        ok "Key already exists: $KEY_PATH"
+    else
+        info "Generating SSH key..."
+        ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" -C "$(whoami)@hpc-connect-${HOST_ALIAS}" -q
+        ok "Key generated: $KEY_PATH"
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "  ${BOLD}║ ADD THIS PUBLIC KEY TO THE TARGET HOST:          ║${NC}"
+    echo -e "  ${BOLD}╚══════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${YELLOW}$(cat "${KEY_PATH}.pub")${NC}"
+    echo ""
+    echo -e "  ${DIM}On the target host (${TARGET_USER}@${TARGET_HOST}), run:${NC}"
+    echo -e "  ${CYAN}mkdir -p ~/.ssh && echo '$(cat "${KEY_PATH}.pub")' >> ~/.ssh/authorized_keys${NC}"
+    echo ""
+
+    # Offer to auto-copy if we can reach the host with a password
+    echo -en "  ${BOLD}?${NC} Try to copy key automatically with password? [Y/n] "
+    read -r yn
+    if [[ ! "$yn" =~ ^[Nn] ]]; then
+        local SSH_OPTS="-o StrictHostKeyChecking=no -p $TARGET_PORT"
+        [ -n "$TARGET_PROXY" ] && SSH_OPTS="$SSH_OPTS -o ProxyCommand='$TARGET_PROXY'"
+
+        echo -en "  ${BOLD}?${NC} Password for ${TARGET_USER}@${TARGET_HOST}: "
+        read -rs TARGET_PASS
+        echo ""
+
+        if command -v sshpass &>/dev/null; then
+            eval sshpass -p "'$TARGET_PASS'" ssh-copy-id -i "${KEY_PATH}.pub" $SSH_OPTS "${TARGET_USER}@${TARGET_HOST}" 2>&1 | tail -3
+        else
+            warn "sshpass not installed. Please add the key manually."
+            echo -en "  ${BOLD}?${NC} Press Enter once the key is added..."
+            read -r
+        fi
+    else
+        echo -en "  ${BOLD}?${NC} Press Enter once the key is added..."
+        read -r
+    fi
+
+    # ─── Test Connection ─────────────────────────────────────
+    echo ""
+    echo -e "${BOLD}Step 3: Testing Connection${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    local SSH_CMD="ssh -o ConnectTimeout=10 -o BatchMode=yes -i $KEY_PATH -p $TARGET_PORT"
+    [ -n "$TARGET_PROXY" ] && SSH_CMD="$SSH_CMD -o ProxyCommand='$TARGET_PROXY'"
+    SSH_CMD="$SSH_CMD ${TARGET_USER}@${TARGET_HOST}"
+
+    if eval $SSH_CMD \"echo connected\" >/dev/null 2>&1; then
+        ok "Connection successful!"
+
+        # Detect services on the target
+        info "Scanning for AI services on target..."
+        local SERVICES
+        SERVICES=$(eval $SSH_CMD \"'for p in 18080 18082 18083 8080 8082 8083 8888 11434; do (echo > /dev/tcp/localhost/\$p) 2>/dev/null && echo \$p; done'\" 2>/dev/null)
+
+        if [ -n "$SERVICES" ]; then
+            echo ""
+            echo -e "  ${BOLD}Detected services on ${TARGET_HOST}:${NC}"
+            while read -r port; do
+                local svc_name=""
+                case "$port" in
+                    18080|8080) svc_name="LLM (vLLM/OpenAI API)" ;;
+                    18082|8082) svc_name="ASR (Speech-to-Text)" ;;
+                    18083|8083) svc_name="TTS (Text-to-Speech)" ;;
+                    8888)       svc_name="Jupyter Lab" ;;
+                    11434)      svc_name="Ollama" ;;
+                    *)          svc_name="Unknown service" ;;
+                esac
+                echo -e "    ${GREEN}:${port}${NC}  $svc_name"
+            done <<< "$SERVICES"
+        fi
+    else
+        fail "Connection failed. Check host, user, key, and proxy settings."
+        echo -en "  ${BOLD}?${NC} Continue anyway? [y/N] "
+        read -r yn
+        [[ ! "$yn" =~ ^[Yy] ]] && exit 1
+    fi
+
+    # ─── Port Forwards ───────────────────────────────────────
+    echo ""
+    echo -e "${BOLD}Step 4: Port Forwards${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+    echo -e "  ${DIM}Which ports to forward from ${TARGET_HOST} to your localhost.${NC}"
+    echo -e "  ${DIM}Format: LOCAL_PORT:REMOTE_PORT (same port = just enter the number)${NC}"
+    echo ""
+
+    local PORTS=""
+    if [ -n "$SERVICES" ]; then
+        echo -en "  ${BOLD}?${NC} Forward all detected ports? [Y/n] "
+        read -r yn
+        if [[ ! "$yn" =~ ^[Nn] ]]; then
+            while read -r port; do
+                [ -n "$PORTS" ] && PORTS="${PORTS},"
+                PORTS="${PORTS}${port}:${port}"
+            done <<< "$SERVICES"
+            ok "Forwarding: $PORTS"
+        fi
+    fi
+
+    if [ -z "$PORTS" ]; then
+        echo -e "  ${DIM}Enter ports one per line (blank to finish):${NC}"
+        while true; do
+            echo -en "  ${BOLD}?${NC} Port (LOCAL:REMOTE or just PORT): "
+            read -r input
+            [ -z "$input" ] && break
+            # If just a number, use same port for both
+            if [[ "$input" =~ ^[0-9]+$ ]]; then
+                input="${input}:${input}"
+            fi
+            [ -n "$PORTS" ] && PORTS="${PORTS},"
+            PORTS="${PORTS}${input}"
+        done
+    fi
+
+    if [ -z "$PORTS" ]; then
+        PORTS="18080:18080,18082:18082,18083:18083"
+        warn "No ports specified, using defaults: $PORTS"
+    fi
+
+    # ─── Save config ─────────────────────────────────────────
+    cat > "$CONF_FILE" << EOF
+# hpc-connect config for: $HOST_ALIAS
+TARGET_HOST=$TARGET_HOST
+TARGET_USER=$TARGET_USER
+TARGET_PORT=$TARGET_PORT
+TARGET_PROXY=$TARGET_PROXY
+TARGET_KEY=$KEY_PATH
+FORWARD_PORTS=$PORTS
+EOF
+
+    ok "Config saved: $CONF_FILE"
+
+    # ─── Create systemd service ──────────────────────────────
+    local SERVICE_NAME="hpc-connect-${HOST_ALIAS}"
+    local SERVICE_FILE="$SYSTEMD_DIR/${SERVICE_NAME}.service"
+    local TUNNEL_SCRIPT="$HOME/.local/bin/${SERVICE_NAME}.sh"
+
+    mkdir -p "$HOME/.local/bin"
+
+    cat > "$TUNNEL_SCRIPT" << 'SCRIPTEOF'
+#!/bin/bash
+source "$HOME/.config/hpc-connect/HOSTALIAS.conf"
+FORWARD_ARGS=""
+IFS=',' read -ra PAIRS <<< "$FORWARD_PORTS"
+for pair in "${PAIRS[@]}"; do
+    local_port=$(echo "$pair" | cut -d: -f1)
+    remote_port=$(echo "$pair" | cut -d: -f2)
+    FORWARD_ARGS="$FORWARD_ARGS -L ${local_port}:localhost:${remote_port}"
+done
+SSH_CMD="/usr/bin/ssh -N \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    -o ConnectTimeout=15 \
+    -o BatchMode=yes \
+    -i $TARGET_KEY \
+    -p $TARGET_PORT"
+[ -n "$TARGET_PROXY" ] && SSH_CMD="$SSH_CMD -o ProxyCommand='$TARGET_PROXY'"
+SSH_CMD="$SSH_CMD $FORWARD_ARGS ${TARGET_USER}@${TARGET_HOST}"
+eval exec $SSH_CMD
+SCRIPTEOF
+    sed -i "s|HOSTALIAS|${HOST_ALIAS}|g" "$TUNNEL_SCRIPT"
+    chmod +x "$TUNNEL_SCRIPT"
+
+    cat > "$SERVICE_FILE" << EOF
+[Unit]
+Description=SSH tunnel to $HOST_ALIAS ($TARGET_HOST) for AI services
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$TUNNEL_SCRIPT
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+    systemctl --user daemon-reload
+    systemctl --user enable "$SERVICE_NAME" 2>/dev/null
+
+    ok "Systemd service created: $SERVICE_NAME"
+
+    # ─── Start ───────────────────────────────────────────────
+    echo ""
+    echo -en "  ${BOLD}?${NC} Start tunnel now? [Y/n] "
+    read -r yn
+    if [[ ! "$yn" =~ ^[Nn] ]]; then
+        connect_host "$HOST_ALIAS"
+    fi
+
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║${NC}  ${BOLD}Setup complete!${NC}                                ${GREEN}║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${BOLD}Commands:${NC}"
+    echo -e "    ${CYAN}hpc-connect ${HOST_ALIAS}${NC}          Start tunnel"
+    echo -e "    ${CYAN}hpc-connect --stop ${HOST_ALIAS}${NC}   Stop tunnel"
+    echo -e "    ${CYAN}hpc-connect --status${NC}         Show all tunnels"
+    echo ""
+    echo -e "  ${BOLD}Services on localhost:${NC}"
+    IFS=',' read -ra PAIRS <<< "$PORTS"
+    for pair in "${PAIRS[@]}"; do
+        lp=$(echo "$pair" | cut -d: -f1)
+        echo -e "    localhost:${lp}"
+    done
+    echo ""
+}
+
+# ─── Connect to a configured host ────────────────────────────
+connect_host() {
+    local HOST_ALIAS="$1"
+    local CONF_FILE="$CONNECT_DIR/${HOST_ALIAS}.conf"
+
+    if [ ! -f "$CONF_FILE" ]; then
+        fail "Host '$HOST_ALIAS' not configured. Run: hpc-connect --setup $HOST_ALIAS"
+        exit 1
+    fi
+
+    local SERVICE_NAME="hpc-connect-${HOST_ALIAS}"
+    systemctl --user restart "$SERVICE_NAME"
+    sleep 3
+
+    if systemctl --user is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+        source "$CONF_FILE"
+        ok "Connected to $HOST_ALIAS ($TARGET_HOST)"
+        IFS=',' read -ra PAIRS <<< "$FORWARD_PORTS"
+        for pair in "${PAIRS[@]}"; do
+            lp=$(echo "$pair" | cut -d: -f1)
+            rp=$(echo "$pair" | cut -d: -f2)
+            echo -e "  localhost:${lp} → ${TARGET_HOST}:${rp}"
+        done
+    else
+        fail "Tunnel failed. Check: systemctl --user status $SERVICE_NAME"
+    fi
+}
+
+# ─── List configured hosts ───────────────────────────────────
+list_hosts() {
+    local confs=("$CONNECT_DIR"/*.conf)
+    if [ ! -f "${confs[0]}" ]; then
+        echo "No configured hosts. Run: hpc-connect --setup"
+        return
+    fi
+
+    echo -e "${BOLD}Configured Hosts${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    for conf in "${confs[@]}"; do
+        local alias=$(basename "$conf" .conf)
+        source "$conf"
+        local status="stopped"
+        systemctl --user is-active "hpc-connect-${alias}" >/dev/null 2>&1 && status="${GREEN}active${NC}"
+        printf "  ${CYAN}%-15s${NC} %s@%s  ports=%s  [%b]\n" \
+            "$alias" "$TARGET_USER" "$TARGET_HOST" "$FORWARD_PORTS" "$status"
+    done
+    echo ""
+}
+
+# ─── Status ──────────────────────────────────────────────────
+show_status() {
+    list_hosts
+    echo ""
+    for conf in "$CONNECT_DIR"/*.conf; do
+        [ ! -f "$conf" ] && continue
+        local alias=$(basename "$conf" .conf)
+        systemctl --user status "hpc-connect-${alias}" --no-pager 2>/dev/null
+        echo ""
+    done
+}
+
+# ─── Main ────────────────────────────────────────────────────
+case "${1:-}" in
+    --setup|-S)
+        setup_host "${2:-}"
+        ;;
+    --status|-s)
+        show_status
+        ;;
+    --stop)
+        if [ -n "$2" ]; then
+            systemctl --user stop "hpc-connect-${2}"
+            ok "Stopped: $2"
+        else
+            for conf in "$CONNECT_DIR"/*.conf; do
+                [ ! -f "$conf" ] && continue
+                local alias=$(basename "$conf" .conf)
+                systemctl --user stop "hpc-connect-${alias}" 2>/dev/null
+            done
+            ok "All tunnels stopped"
+        fi
+        ;;
+    --list|-l)
+        list_hosts
+        ;;
+    --help|-h)
+        cat << 'EOF'
+hpc-connect — Connect to workstations/gateways with AI services
+
+USAGE:
+    hpc-connect                      Interactive setup + connect
+    hpc-connect <name>               Connect to a configured host
+    hpc-connect --setup [name]       First-time setup for a host
+    hpc-connect --stop [name]        Stop tunnel (all if no name)
+    hpc-connect --status             Show all tunnel status
+    hpc-connect --list               List configured hosts
+    hpc-connect --help               Show this help
+
+FIRST TIME:
+    hpc-connect --setup workstation
+
+    This will:
+    1. Generate an SSH keypair
+    2. Help you add the public key to the target
+    3. Test the connection
+    4. Auto-detect AI services on the target
+    5. Set up a persistent systemd tunnel
+
+THEN:
+    hpc-connect workstation          Start the tunnel
+    curl http://localhost:18080/...   Use AI services locally
+EOF
+        ;;
+    "")
+        # No args — interactive
+        if ls "$CONNECT_DIR"/*.conf &>/dev/null; then
+            list_hosts
+            echo -e "  ${CYAN}[C]${NC} Connect to a host"
+            echo -e "  ${CYAN}[N]${NC} Set up a new host"
+            echo ""
+            echo -en "  ${BOLD}?${NC} Choice: "
+            read -r choice
+            case "${choice^^}" in
+                C)
+                    echo -en "  ${BOLD}?${NC} Host name: "
+                    read -r host
+                    connect_host "$host"
+                    ;;
+                N)
+                    setup_host ""
+                    ;;
+                *)
+                    # Maybe they typed a host name directly
+                    if [ -f "$CONNECT_DIR/${choice}.conf" ]; then
+                        connect_host "$choice"
+                    else
+                        setup_host "$choice"
+                    fi
+                    ;;
+            esac
+        else
+            setup_host ""
+        fi
+        ;;
+    *)
+        # Positional arg — connect to named host
+        if [ -f "$CONNECT_DIR/${1}.conf" ]; then
+            connect_host "$1"
+        else
+            echo "Host '$1' not configured."
+            echo -en "Set it up now? [Y/n] "
+            read -r yn
+            if [[ ! "$yn" =~ ^[Nn] ]]; then
+                setup_host "$1"
+            fi
+        fi
+        ;;
+esac
