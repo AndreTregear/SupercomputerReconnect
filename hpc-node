@@ -20,6 +20,16 @@ source "$CONF"
 case "${1:-}" in
     "")
         echo "Current node: $HPC_NODE"
+        if [ -n "$FORWARD_PORTS" ]; then
+            echo ""
+            echo "Port forwards:"
+            IFS=',' read -ra PAIRS <<< "$FORWARD_PORTS"
+            for pair in "${PAIRS[@]}"; do
+                lp=$(echo "$pair" | cut -d: -f1)
+                rp=$(echo "$pair" | cut -d: -f2)
+                echo "  localhost:$lp → $HPC_NODE:$rp"
+            done
+        fi
         echo ""
         systemctl --user status hpc-tunnel-forward hpc-tunnel-reverse --no-pager 2>/dev/null
         ;;
@@ -54,6 +64,50 @@ case "${1:-}" in
         echo "Detected node: $NODE"
         exec "$0" "$NODE"
         ;;
+    --ports)
+        # Interactive port manager
+        echo "Current port forwards (LOCAL:REMOTE):"
+        if [ -n "$FORWARD_PORTS" ]; then
+            IFS=',' read -ra PAIRS <<< "$FORWARD_PORTS"
+            for i in "${!PAIRS[@]}"; do
+                echo "  [$((i+1))] ${PAIRS[$i]}"
+            done
+        else
+            echo "  (none)"
+        fi
+        echo ""
+        echo "Commands: [a]dd, [r]emove, [q]uit"
+        while true; do
+            read -rp "> " cmd
+            case "$cmd" in
+                a|add)
+                    read -rp "  Local port: " lp
+                    read -rp "  Remote port on HPC: " rp
+                    if [ -n "$lp" ] && [ -n "$rp" ]; then
+                        if [ -n "$FORWARD_PORTS" ]; then
+                            FORWARD_PORTS="${FORWARD_PORTS},${lp}:${rp}"
+                        else
+                            FORWARD_PORTS="${lp}:${rp}"
+                        fi
+                        sed -i "s/^FORWARD_PORTS=.*/FORWARD_PORTS=${FORWARD_PORTS}/" "$CONF"
+                        echo "  Added ${lp}:${rp}"
+                    fi
+                    ;;
+                r|remove)
+                    read -rp "  Number to remove: " rnum
+                    IFS=',' read -ra PAIRS <<< "$FORWARD_PORTS"
+                    if [ "$rnum" -ge 1 ] && [ "$rnum" -le ${#PAIRS[@]} ] 2>/dev/null; then
+                        unset "PAIRS[$((rnum-1))]"
+                        FORWARD_PORTS=$(IFS=','; echo "${PAIRS[*]}")
+                        sed -i "s/^FORWARD_PORTS=.*/FORWARD_PORTS=${FORWARD_PORTS}/" "$CONF"
+                        echo "  Removed"
+                    fi
+                    ;;
+                q|quit|"") break ;;
+            esac
+        done
+        echo "Restart tunnels with: hpc-node --restart"
+        ;;
     --help|-h)
         cat <<'EOF'
 hpc-node — Manage SSH tunnels to HPC compute nodes
@@ -62,6 +116,7 @@ USAGE:
     hpc-node                  Show current node and tunnel status
     hpc-node <node>           Switch to a new compute node
     hpc-node --auto           Auto-detect node from SLURM queue
+    hpc-node --ports          Add/remove port forwards
     hpc-node --start          Start tunnels
     hpc-node --stop           Stop tunnels
     hpc-node --restart        Restart tunnels
@@ -71,6 +126,7 @@ USAGE:
 EXAMPLES:
     hpc-node c1100a-s15       Switch to node c1100a-s15
     hpc-node --auto           Detect running job and connect
+    hpc-node --ports          Manage forwarded ports
 
 CONFIG:
     ~/.config/hpc-tunnel.conf

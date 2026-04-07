@@ -1,7 +1,27 @@
 #!/bin/bash
 # Reverse tunnel: expose forwarded HPC ports on a remote workstation
-# So the workstation can reach HPC services via localhost
 source "$HOME/.config/hpc-tunnel.conf"
+
+# Build reverse port args from FORWARD_PORTS or legacy vars
+REVERSE_ARGS=""
+
+if [ -n "$FORWARD_PORTS" ]; then
+    IFS=',' read -ra PAIRS <<< "$FORWARD_PORTS"
+    for pair in "${PAIRS[@]}"; do
+        local_port=$(echo "$pair" | cut -d: -f1)
+        REVERSE_ARGS="$REVERSE_ARGS -R ${local_port}:localhost:${local_port}"
+    done
+else
+    [ -n "$LLM_PORT" ] && REVERSE_ARGS="$REVERSE_ARGS -R ${LLM_PORT}:localhost:${LLM_PORT}"
+    [ -n "$ASR_PORT" ] && REVERSE_ARGS="$REVERSE_ARGS -R ${ASR_PORT}:localhost:${ASR_PORT}"
+    [ -n "$TTS_PORT" ] && REVERSE_ARGS="$REVERSE_ARGS -R ${TTS_PORT}:localhost:${TTS_PORT}"
+fi
+
+if [ -z "$REVERSE_ARGS" ]; then
+    echo "No ports configured."
+    exit 1
+fi
+
 exec /usr/bin/ssh -N \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3 \
@@ -9,7 +29,5 @@ exec /usr/bin/ssh -N \
     -o ConnectTimeout=15 \
     -o BatchMode=yes \
     -i "$WORKSTATION_KEY" \
-    -R "${LLM_PORT}:localhost:${LLM_PORT}" \
-    -R "${ASR_PORT}:localhost:${ASR_PORT}" \
-    -R "${TTS_PORT}:localhost:${TTS_PORT}" \
+    $REVERSE_ARGS \
     "${WORKSTATION_USER}@${WORKSTATION}"
