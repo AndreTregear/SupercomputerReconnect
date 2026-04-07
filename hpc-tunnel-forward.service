@@ -1,0 +1,12 @@
+[Unit]
+Description=SSH tunnel: local -> HPC compute node services
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hpc-tunnel-forward.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

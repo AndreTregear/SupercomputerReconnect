@@ -1,0 +1,113 @@
+#!/bin/bash
+# hpc-node — Switch HPC tunnel to a different compute node
+# Part of SupercomputerReconnect
+# Usage: hpc-node <node>        — switch to node and restart tunnels
+#        hpc-node               — show current node and tunnel status
+#        hpc-node --status      — show tunnel status
+#        hpc-node --stop        — stop tunnels
+#        hpc-node --start       — start tunnels
+#        hpc-node --auto        — auto-detect node from SLURM
+
+CONF="$HOME/.config/hpc-tunnel.conf"
+
+if [ ! -f "$CONF" ]; then
+    echo "Error: $CONF not found. Run install.sh first."
+    exit 1
+fi
+
+source "$CONF"
+
+case "${1:-}" in
+    "")
+        echo "Current node: $HPC_NODE"
+        echo ""
+        systemctl --user status hpc-tunnel-forward hpc-tunnel-reverse --no-pager 2>/dev/null
+        ;;
+    --status|-s)
+        systemctl --user status hpc-tunnel-forward hpc-tunnel-reverse --no-pager
+        ;;
+    --stop)
+        systemctl --user stop hpc-tunnel-reverse hpc-tunnel-forward
+        echo "Tunnels stopped."
+        ;;
+    --start)
+        systemctl --user start hpc-tunnel-forward
+        sleep 3
+        systemctl --user start hpc-tunnel-reverse
+        echo "Tunnels started → $HPC_NODE"
+        ;;
+    --restart)
+        systemctl --user restart hpc-tunnel-forward
+        sleep 3
+        systemctl --user restart hpc-tunnel-reverse
+        echo "Tunnels restarted → $HPC_NODE"
+        ;;
+    --auto)
+        # Auto-detect node from SLURM via jump host
+        echo "Querying SLURM..."
+        NODE=$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$HPC_JUMP" \
+            "squeue -u $HPC_USER -h -o '%N' 2>/dev/null" | head -1)
+        if [ -z "$NODE" ]; then
+            echo "No running SLURM job found."
+            exit 1
+        fi
+        echo "Detected node: $NODE"
+        exec "$0" "$NODE"
+        ;;
+    --help|-h)
+        cat <<'EOF'
+hpc-node — Manage SSH tunnels to HPC compute nodes
+
+USAGE:
+    hpc-node                  Show current node and tunnel status
+    hpc-node <node>           Switch to a new compute node
+    hpc-node --auto           Auto-detect node from SLURM queue
+    hpc-node --start          Start tunnels
+    hpc-node --stop           Stop tunnels
+    hpc-node --restart        Restart tunnels
+    hpc-node --status         Show systemd service status
+    hpc-node --help           Show this help
+
+EXAMPLES:
+    hpc-node c1100a-s15       Switch to node c1100a-s15
+    hpc-node --auto           Detect running job and connect
+
+CONFIG:
+    ~/.config/hpc-tunnel.conf
+EOF
+        ;;
+    -*)
+        echo "Unknown option: $1 (try --help)"
+        exit 1
+        ;;
+    *)
+        NEW_NODE="$1"
+        OLD_NODE="$HPC_NODE"
+        sed -i "s/^HPC_NODE=.*/HPC_NODE=${NEW_NODE}/" "$CONF"
+        echo "Node: $OLD_NODE → $NEW_NODE"
+
+        # Update SSH config if there's an hpc host entry
+        if grep -q "^Host hpc$" "$HOME/.ssh/config" 2>/dev/null; then
+            # Update the HostName under the hpc block
+            sed -i "/^Host hpc$/,/^Host /{s/^\(\s*HostName\s\).*/\1${NEW_NODE}/}" "$HOME/.ssh/config"
+        fi
+
+        echo "Restarting tunnels..."
+        systemctl --user restart hpc-tunnel-forward
+        sleep 3
+        systemctl --user restart hpc-tunnel-reverse
+        sleep 2
+
+        # Verify
+        if systemctl --user is-active hpc-tunnel-forward >/dev/null 2>&1; then
+            echo "Tunnels active → $NEW_NODE"
+            source "$CONF"
+            for p in $LLM_PORT $ASR_PORT $TTS_PORT; do
+                echo "  localhost:$p → forwarded"
+            done
+        else
+            echo "Warning: forward tunnel failed. Check: hpc-node --status"
+            echo "  Is EduVPN active? Is the node correct?"
+        fi
+        ;;
+esac

@@ -1,0 +1,13 @@
+[Unit]
+Description=Reverse tunnel: HPC services -> remote workstation
+After=hpc-tunnel-forward.service
+Requires=hpc-tunnel-forward.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hpc-tunnel-reverse.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
