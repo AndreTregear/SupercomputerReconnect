@@ -52,70 +52,57 @@ if vpn_status; then
 else
     warn "VPN not connected — attempting reconnect..."
 
-    # Step A: Try silent reconnect (refresh token may still be valid)
-    eduvpn-cli connect -n 1 >/dev/null 2>&1 &
+    # Disconnect to clear stale state, then reconnect
+    eduvpn-cli disconnect >/dev/null 2>&1
+    sleep 1
+
+    # Create URL capture script
+    URL_FILE=$(mktemp)
+    CAPTURE_SCRIPT=$(mktemp)
+    cat > "$CAPTURE_SCRIPT" << CAPTUREEOF
+#!/bin/bash
+echo "\$@" > "$URL_FILE"
+CAPTUREEOF
+    chmod +x "$CAPTURE_SCRIPT"
+
+    # Connect with BROWSER capture — silent refresh if token valid,
+    # otherwise captures the auth URL for Playwright
+    BROWSER="$CAPTURE_SCRIPT" eduvpn-cli connect -n 1 >/dev/null 2>&1 &
     CONNECT_PID=$!
 
-    # Wait up to 15s for silent refresh to complete
+    # Wait: either VPN comes up (silent) or URL appears (needs browser)
+    AUTH_URL=""
     for i in $(seq 1 15); do
         if vpn_status; then break; fi
+        if [ -s "$URL_FILE" ]; then
+            AUTH_URL=$(cat "$URL_FILE")
+            break
+        fi
         sleep 1
     done
 
-    kill $CONNECT_PID 2>/dev/null || true
-    wait $CONNECT_PID 2>/dev/null || true
+    rm -f "$CAPTURE_SCRIPT"
 
     if vpn_status; then
+        kill $CONNECT_PID 2>/dev/null || true
+        rm -f "$URL_FILE"
         ok "VPN reconnected via refresh token"
-    else
-        # Step B: Refresh token expired — force renew with browser automation
-        warn "Silent reconnect failed — forcing OAuth renew..."
-
-        # First connect so we have a session to renew
-        eduvpn-cli connect -n 1 >/dev/null 2>&1 || true
-        sleep 3
+    elif [ -n "$AUTH_URL" ]; then
+        # Refresh token expired — need browser auth
+        warn "Browser auth needed — launching Playwright..."
 
         if [ -z "$IDP_USER" ] || [ -z "$IDP_PASS" ]; then
             fail "IDP_USER and IDP_PASS not set in $ENV_FILE"
             echo "  Add your IdP credentials to $ENV_FILE:"
             echo "    IDP_USER=youruser"
             echo "    IDP_PASS=yourpassword"
-            exit 1
-        fi
-
-        # Create a capture script that saves the URL eduvpn passes to $BROWSER
-        URL_FILE=$(mktemp)
-        CAPTURE_SCRIPT=$(mktemp)
-        cat > "$CAPTURE_SCRIPT" << CAPTUREEOF
-#!/bin/bash
-echo "\$@" > "$URL_FILE"
-CAPTUREEOF
-        chmod +x "$CAPTURE_SCRIPT"
-
-        # Run renew — it disconnects, starts OAuth, and calls $BROWSER with the auth URL
-        BROWSER="$CAPTURE_SCRIPT" eduvpn-cli renew >/dev/null 2>&1 &
-        RENEW_PID=$!
-
-        # Wait for the auth URL to be captured
-        AUTH_URL=""
-        for i in $(seq 1 20); do
-            if [ -s "$URL_FILE" ]; then
-                AUTH_URL=$(cat "$URL_FILE")
-                break
-            fi
-            sleep 1
-        done
-        rm -f "$CAPTURE_SCRIPT"
-
-        if [ -z "$AUTH_URL" ]; then
-            fail "Could not capture auth URL from eduvpn-cli renew"
-            kill $RENEW_PID 2>/dev/null || true
+            kill $CONNECT_PID 2>/dev/null || true
             rm -f "$URL_FILE"
             exit 1
         fi
-        rm -f "$URL_FILE"
 
-        echo "  Auth URL captured, launching Playwright..."
+        echo "  Auth URL: ${AUTH_URL:0:80}..."
+        rm -f "$URL_FILE"
 
         # Run Playwright to complete the Shibboleth login
         PLAYWRIGHT_SCRIPT="$SCRIPT_DIR/eduvpn-auth.js"
@@ -134,8 +121,8 @@ CAPTUREEOF
             sleep 2
         done
 
-        kill $RENEW_PID 2>/dev/null || true
-        wait $RENEW_PID 2>/dev/null || true
+        kill $CONNECT_PID 2>/dev/null || true
+        wait $CONNECT_PID 2>/dev/null || true
 
         if vpn_status; then
             ok "VPN authenticated via browser automation"
@@ -143,6 +130,12 @@ CAPTUREEOF
             fail "VPN auth failed. Debug screenshot at /tmp/eduvpn-auth-debug.png"
             exit 1
         fi
+    else
+        # Neither connected nor got a URL
+        kill $CONNECT_PID 2>/dev/null || true
+        rm -f "$URL_FILE"
+        fail "VPN failed — no connection and no auth URL captured"
+        exit 1
     fi
 fi
 
