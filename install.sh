@@ -116,8 +116,8 @@ EOF
         ENV_FILE="$HOME/.config/hpc-tunnel.env"
         cat > "$ENV_FILE" <<EOF
 # Credentials for hpc-reconnect (NEVER commit this file)
-IDP_USER=$IDP_USER
-IDP_PASS=$IDP_PASS
+IDP_USER='$IDP_USER'
+IDP_PASS='$IDP_PASS'
 EOF
         chmod 600 "$ENV_FILE"
         echo "Credentials written to $ENV_FILE (mode 600)"
@@ -207,13 +207,14 @@ fi
 
 # ─── Install Playwright browser (for EduVPN auth) ───────────
 
-if command -v npx &>/dev/null; then
+if command -v node &>/dev/null; then
     echo ""
-    echo "── Installing Playwright Chromium (for EduVPN auth) ──"
+    echo "── Installing Playwright (for EduVPN auth) ──"
+    (cd "$SHARE_DIR" && npm init -y >/dev/null 2>&1 && npm install playwright 2>&1 | tail -2)
     npx playwright install chromium 2>&1 | tail -2
 else
     echo ""
-    echo "NOTE: npx not found. Install Node.js for EduVPN browser automation."
+    echo "NOTE: Node.js not found. Install it for EduVPN browser automation:"
     echo "  sudo apt install nodejs npm"
 fi
 

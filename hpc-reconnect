@@ -1,5 +1,5 @@
 #!/bin/bash
-set -eo pipefail
+set -o pipefail
 
 # hpc-reconnect — Full automated reconnect pipeline:
 #   1. Check/establish EduVPN
@@ -52,14 +52,28 @@ if vpn_status; then
 else
     warn "VPN not connected — attempting reconnect..."
 
-    # Try silent reconnect first (uses refresh token if still valid)
-    CONNECT_OUTPUT=$(eduvpn-cli connect -n 1 -y 2>&1) || true
+    # Step A: Try silent reconnect (refresh token may still be valid)
+    eduvpn-cli connect -n 1 >/dev/null 2>&1 &
+    CONNECT_PID=$!
+
+    # Wait up to 15s for silent refresh to complete
+    for i in $(seq 1 15); do
+        if vpn_status; then break; fi
+        sleep 1
+    done
+
+    kill $CONNECT_PID 2>/dev/null || true
+    wait $CONNECT_PID 2>/dev/null || true
 
     if vpn_status; then
         ok "VPN reconnected via refresh token"
     else
-        # Refresh token expired — need browser auth
-        warn "Refresh token expired — launching browser auth..."
+        # Step B: Refresh token expired — force renew with browser automation
+        warn "Silent reconnect failed — forcing OAuth renew..."
+
+        # First connect so we have a session to renew
+        eduvpn-cli connect -n 1 >/dev/null 2>&1 || true
+        sleep 3
 
         if [ -z "$IDP_USER" ] || [ -z "$IDP_PASS" ]; then
             fail "IDP_USER and IDP_PASS not set in $ENV_FILE"
@@ -69,46 +83,60 @@ else
             exit 1
         fi
 
-        # Start eduvpn-cli renew in background, capture the auth URL
-        RENEW_LOG=$(mktemp)
-        eduvpn-cli renew -y 2>&1 | tee "$RENEW_LOG" &
+        # Create a capture script that saves the URL eduvpn passes to $BROWSER
+        URL_FILE=$(mktemp)
+        CAPTURE_SCRIPT=$(mktemp)
+        cat > "$CAPTURE_SCRIPT" << CAPTUREEOF
+#!/bin/bash
+echo "\$@" > "$URL_FILE"
+CAPTUREEOF
+        chmod +x "$CAPTURE_SCRIPT"
+
+        # Run renew — it disconnects, starts OAuth, and calls $BROWSER with the auth URL
+        BROWSER="$CAPTURE_SCRIPT" eduvpn-cli renew >/dev/null 2>&1 &
         RENEW_PID=$!
 
-        # Wait for the auth URL to appear in output
+        # Wait for the auth URL to be captured
         AUTH_URL=""
-        for i in $(seq 1 30); do
+        for i in $(seq 1 20); do
+            if [ -s "$URL_FILE" ]; then
+                AUTH_URL=$(cat "$URL_FILE")
+                break
+            fi
             sleep 1
-            AUTH_URL=$(grep -oP 'https://[^ ]+authorize[^ ]*' "$RENEW_LOG" 2>/dev/null | head -1)
-            if [ -n "$AUTH_URL" ]; then break; fi
-            # Also check for generic URL pattern from eduvpn
-            AUTH_URL=$(grep -oP 'https://[^ "]+' "$RENEW_LOG" 2>/dev/null | grep -i 'auth\|login\|oauth' | head -1)
-            if [ -n "$AUTH_URL" ]; then break; fi
         done
+        rm -f "$CAPTURE_SCRIPT"
 
         if [ -z "$AUTH_URL" ]; then
-            fail "Could not capture auth URL from eduvpn-cli"
-            cat "$RENEW_LOG"
-            rm -f "$RENEW_LOG"
+            fail "Could not capture auth URL from eduvpn-cli renew"
             kill $RENEW_PID 2>/dev/null || true
+            rm -f "$URL_FILE"
             exit 1
         fi
+        rm -f "$URL_FILE"
 
-        echo "  Auth URL captured, automating login..."
+        echo "  Auth URL captured, launching Playwright..."
 
-        # Run Playwright to complete the auth
+        # Run Playwright to complete the Shibboleth login
         PLAYWRIGHT_SCRIPT="$SCRIPT_DIR/eduvpn-auth.js"
         if [ ! -f "$PLAYWRIGHT_SCRIPT" ]; then
             PLAYWRIGHT_SCRIPT="$HOME/.local/share/hpc-reconnect/eduvpn-auth.js"
         fi
 
+        NODE_PATH="$HOME/.local/share/hpc-reconnect/node_modules" \
         AUTH_URL="$AUTH_URL" IDP_USER="$IDP_USER" IDP_PASS="$IDP_PASS" \
             node "$PLAYWRIGHT_SCRIPT" 2>&1
 
-        # Wait for eduvpn-cli to finish
-        wait $RENEW_PID 2>/dev/null || true
-        rm -f "$RENEW_LOG"
+        # Wait for eduvpn-cli to finish token exchange + WireGuard setup
+        echo "  Waiting for VPN tunnel..."
+        for i in $(seq 1 45); do
+            if vpn_status; then break; fi
+            sleep 2
+        done
 
-        sleep 3
+        kill $RENEW_PID 2>/dev/null || true
+        wait $RENEW_PID 2>/dev/null || true
+
         if vpn_status; then
             ok "VPN authenticated via browser automation"
         else
