@@ -16,6 +16,11 @@ fail()  { echo -e "  ${RED}✗${NC} $1"; }
 warn()  { echo -e "  ${YELLOW}!${NC} $1"; }
 info()  { echo -e "  ${CYAN}→${NC} $1"; }
 
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+PRESETS_FILE="$SCRIPT_DIR/hipergator-presets.sh"
+[ ! -f "$PRESETS_FILE" ] && PRESETS_FILE="$HOME/.local/share/hpc-reconnect/hipergator-presets.sh"
+[ -f "$PRESETS_FILE" ] && source "$PRESETS_FILE"
+
 if [ ! -f "$CONF" ]; then
     echo "Run hpc-setup first."
     exit 1
@@ -112,44 +117,106 @@ show_templates() {
     return 0
 }
 
+# ─── Build from preset ───────────────────────────────────────
+build_from_preset() {
+    echo -e "\n${BOLD}Quick Build from Preset${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    if [ -n "${HIPERGATOR_PRESETS+x}" ]; then
+        show_hipergator_presets
+    else
+        warn "No presets file found."
+        build_job
+        return
+    fi
+
+    echo -en "  ${BOLD}?${NC} Select preset number: "
+    read -r pnum
+
+    local pdata
+    pdata=$(get_preset "$pnum")
+    if [ -z "$pdata" ]; then
+        fail "Invalid preset"
+        return 1
+    fi
+
+    IFS='|' read -r _name JOB_PARTITION _gtype JOB_GPUS _maxgpus JOB_CPUS JOB_MEM JOB_TIME _desc <<< "$pdata"
+
+    echo ""
+    ok "Preset: ${BOLD}$_name${NC} — $_desc"
+    echo ""
+
+    echo -en "  ${BOLD}?${NC} Job name [research]: "
+    read -r input; JOB_NAME="${input:-research}"
+
+    echo -en "  ${BOLD}?${NC} Time limit [$JOB_TIME]: "
+    read -r input; JOB_TIME="${input:-$JOB_TIME}"
+
+    echo -en "  ${BOLD}?${NC} Email for notifications (blank to skip): "
+    read -r JOB_EMAIL
+
+    echo ""
+    echo -e "  ${BOLD}Post-start command:${NC}"
+    echo -e "  ${DIM}  Examples:${NC}"
+    echo -e "  ${DIM}    bash ~/serve_vllm.sh     (start vLLM server)${NC}"
+    echo -e "  ${DIM}    jupyter lab --port 8888   (start Jupyter)${NC}"
+    echo -e "  ${DIM}    sleep 1d                  (just hold the GPU)${NC}"
+    echo -en "  ${BOLD}?${NC} Command [sleep 1d]: "
+    read -r input; JOB_CMD="${input:-sleep 1d}"
+
+    generate_script
+}
+
 # ─── Build a new job interactively ───────────────────────────
 build_job() {
-    echo -e "\n${BOLD}Build a New Job${NC}"
+    echo -e "\n${BOLD}Build a New Job (custom)${NC}"
     echo -e "${DIM}────────────────────────────────────────${NC}"
 
     # Partition selection
-    if [ ${#PARTITION_LIST[@]} -gt 0 ]; then
+    if [ -n "${HIPERGATOR_PRESETS+x}" ]; then
+        show_hipergator_presets
+        echo -en "  ${BOLD}?${NC} Select preset number, or type partition name: "
+        read -r input
+        if [[ "$input" =~ ^[0-9]+$ ]]; then
+            local pdata
+            pdata=$(get_preset "$input")
+            if [ -n "$pdata" ]; then
+                IFS='|' read -r _name JOB_PARTITION _gtype JOB_GPUS _maxgpus JOB_CPUS JOB_MEM JOB_TIME _desc <<< "$pdata"
+                ok "Base: $_name — customize below (Enter to keep defaults)"
+            else
+                JOB_PARTITION="$input"
+            fi
+        else
+            JOB_PARTITION="$input"
+        fi
+    elif [ ${#PARTITION_LIST[@]} -gt 0 ]; then
         echo -en "  ${BOLD}?${NC} Select partition number or type name: "
         read -r input
         if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le ${#PARTITION_LIST[@]} ]; then
-            local pdata="${PARTITION_LIST[$((input-1))]}"
-            JOB_PARTITION=$(echo "$pdata" | cut -d'|' -f1)
-            local pgres=$(echo "$pdata" | cut -d'|' -f2)
-            local ptime=$(echo "$pdata" | cut -d'|' -f3)
+            local pldata="${PARTITION_LIST[$((input-1))]}"
+            JOB_PARTITION=$(echo "$pldata" | cut -d'|' -f1)
         else
             JOB_PARTITION="$input"
-            pgres=""
-            ptime=""
         fi
     else
         echo -en "  ${BOLD}?${NC} Partition: "
         read -r JOB_PARTITION
     fi
 
-    echo -en "  ${BOLD}?${NC} Job name [research]: "
-    read -r input; JOB_NAME="${input:-research}"
+    echo -en "  ${BOLD}?${NC} Job name [${JOB_NAME:-research}]: "
+    read -r input; JOB_NAME="${input:-${JOB_NAME:-research}}"
 
-    echo -en "  ${BOLD}?${NC} GPUs [1]: "
-    read -r input; JOB_GPUS="${input:-1}"
+    echo -en "  ${BOLD}?${NC} GPUs [${JOB_GPUS:-1}]: "
+    read -r input; JOB_GPUS="${input:-${JOB_GPUS:-1}}"
 
-    echo -en "  ${BOLD}?${NC} CPUs per task [8]: "
-    read -r input; JOB_CPUS="${input:-8}"
+    echo -en "  ${BOLD}?${NC} CPUs per task [${JOB_CPUS:-8}]: "
+    read -r input; JOB_CPUS="${input:-${JOB_CPUS:-8}}"
 
-    echo -en "  ${BOLD}?${NC} Memory [64gb]: "
-    read -r input; JOB_MEM="${input:-64gb}"
+    echo -en "  ${BOLD}?${NC} Memory [${JOB_MEM:-64gb}]: "
+    read -r input; JOB_MEM="${input:-${JOB_MEM:-64gb}}"
 
-    echo -en "  ${BOLD}?${NC} Time limit [${ptime:-1-00:00:00}]: "
-    read -r input; JOB_TIME="${input:-${ptime:-1-00:00:00}}"
+    echo -en "  ${BOLD}?${NC} Time limit [${JOB_TIME:-1-00:00:00}]: "
+    read -r input; JOB_TIME="${input:-${JOB_TIME:-1-00:00:00}}"
 
     echo -en "  ${BOLD}?${NC} Email for notifications (blank to skip): "
     read -r JOB_EMAIL
@@ -163,17 +230,25 @@ build_job() {
     echo -en "  ${BOLD}?${NC} Command [sleep 1d]: "
     read -r input; JOB_CMD="${input:-sleep 1d}"
 
-    # Generate script
+    generate_script
+}
+
+# ─── Generate SLURM script from current vars ────────────────
+generate_script() {
     local SCRIPT_CONTENT="#!/bin/bash
 #SBATCH --job-name=${JOB_NAME}
 #SBATCH --partition=${JOB_PARTITION}
 #SBATCH --nodes=1
-#SBATCH --gpus=${JOB_GPUS}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=${JOB_CPUS}
 #SBATCH --mem=${JOB_MEM}
 #SBATCH --time=${JOB_TIME}
 #SBATCH --output=${JOB_NAME}-%j.log"
+
+    if [ "${JOB_GPUS:-0}" != "0" ]; then
+        SCRIPT_CONTENT+="
+#SBATCH --gpus=${JOB_GPUS}"
+    fi
 
     if [ -n "$JOB_EMAIL" ]; then
         SCRIPT_CONTENT+="
@@ -187,7 +262,10 @@ echo \"============================================\"
 echo \"Node: \$(hostname)\"
 echo \"Job ID: \$SLURM_JOB_ID\"
 echo \"Started: \$(date)\"
-echo \"GPUs: ${JOB_GPUS}\"
+echo \"GPUs: ${JOB_GPUS:-0}\"
+echo \"\"
+echo \"SSH tunnel:\"
+echo \"  hpc-node \$(hostname)\"
 echo \"============================================\"
 
 ${JOB_CMD}"
@@ -325,10 +403,13 @@ main_menu() {
 
     echo -e "${BOLD}What do you want to do?${NC}"
     echo ""
+    if [ -n "${HIPERGATOR_PRESETS+x}" ]; then
+        echo -e "  ${CYAN}[P]${NC} ${BOLD}Quick build from preset${NC} (recommended)"
+    fi
     if [ "$HAS_TEMPLATES" = true ]; then
         echo -e "  ${CYAN}[T]${NC} Submit a saved template"
     fi
-    echo -e "  ${CYAN}[N]${NC} Build a new job"
+    echo -e "  ${CYAN}[N]${NC} Build a custom job"
     if [ -n "$SLURM_JOB_SCRIPT" ]; then
         echo -e "  ${CYAN}[R]${NC} Re-submit last job ($SLURM_JOB_SCRIPT)"
     fi
@@ -339,6 +420,14 @@ main_menu() {
     read -r choice
 
     case "${choice^^}" in
+        P)
+            if [ -z "${HIPERGATOR_PRESETS+x}" ]; then
+                fail "No presets available"
+                exit 1
+            fi
+            build_from_preset
+            submit_and_connect "" "$JOB_SCRIPT_CONTENT"
+            ;;
         T)
             if [ "$HAS_TEMPLATES" != true ]; then
                 fail "No saved templates"
@@ -404,9 +493,13 @@ case "${1:-}" in
         fi
         submit_and_connect "$TMPL" ""
         ;;
+    --preset|-p)
+        check_access
+        build_from_preset
+        submit_and_connect "" "$JOB_SCRIPT_CONTENT"
+        ;;
     --new|-n)
         check_access
-        show_partitions
         build_job
         submit_and_connect "" "$JOB_SCRIPT_CONTENT"
         ;;
@@ -419,10 +512,14 @@ hpc-job — Interactive SLURM job builder
 
 USAGE:
     hpc-job                  Interactive menu
-    hpc-job --new            Build and submit a new job
+    hpc-job --preset         Quick build from HiPerGator presets
+    hpc-job --new            Build a fully custom job
     hpc-job --submit NAME    Submit a saved template
     hpc-job --list           List saved templates
     hpc-job --help           Show this help
+
+PRESETS:
+    B200 (1/2/4/8 GPU), L4 (1/3 GPU), CPU-only dev/compute/burst
 
 TEMPLATES:
     Saved in ~/.config/hpc-jobs/
