@@ -1,0 +1,6 @@
+[Unit]
+Description=Preemptive SLURM job renewal
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/hpc-keepalive.sh

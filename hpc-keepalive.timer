@@ -1,0 +1,10 @@
+[Unit]
+Description=Check SLURM job health and renew before expiry
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
