@@ -1,0 +1,435 @@
+#!/bin/bash
+# hpc-job — Interactive SLURM job builder and submitter
+# Submit jobs from saved templates or build one interactively,
+# then auto-connect tunnels when the job starts.
+
+set -o pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+CONF="$HOME/.config/hpc-tunnel.conf"
+JOBS_DIR="$HOME/.config/hpc-jobs"
+
+ok()    { echo -e "  ${GREEN}✓${NC} $1"; }
+fail()  { echo -e "  ${RED}✗${NC} $1"; }
+warn()  { echo -e "  ${YELLOW}!${NC} $1"; }
+info()  { echo -e "  ${CYAN}→${NC} $1"; }
+
+if [ ! -f "$CONF" ]; then
+    echo "Run hpc-setup first."
+    exit 1
+fi
+source "$CONF"
+JOBS_DIR="${JOBS_DIR:-$HOME/.config/hpc-jobs}"
+mkdir -p "$JOBS_DIR"
+
+# ─── HPC connection helper ───────────────────────────────────
+hpc_ssh() {
+    ssh -o ConnectTimeout=15 -o BatchMode=yes "$HPC_JUMP" "$@" 2>/dev/null
+}
+
+# ─── Check HPC access ───────────────────────────────────────
+check_access() {
+    if ! hpc_ssh "echo ok" >/dev/null 2>&1; then
+        fail "Cannot reach HPC jump host."
+        echo -e "  ${DIM}Try: hpc-reconnect (to establish VPN + tunnels)${NC}"
+        exit 1
+    fi
+}
+
+# ─── Show running jobs ──────────────────────────────────────
+show_running() {
+    echo -e "\n${BOLD}Current Jobs${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+    local JOBS
+    JOBS=$(hpc_ssh "squeue -u \$USER -o '  %i  %-10P  %-12j  %T  %M  %N' 2>/dev/null")
+    if [ -n "$JOBS" ]; then
+        echo "$JOBS"
+    else
+        echo -e "  ${DIM}No running jobs${NC}"
+    fi
+    echo ""
+}
+
+# ─── Show available partitions ───────────────────────────────
+show_partitions() {
+    echo -e "${BOLD}Available Partitions${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    # Cache partition info
+    local PINFO
+    PINFO=$(hpc_ssh "sinfo -h -o '%P|%G|%l|%D|%a' 2>/dev/null | sort -u")
+
+    if [ -z "$PINFO" ]; then
+        warn "Could not query partitions"
+        return
+    fi
+
+    local idx=1
+    PARTITION_LIST=()
+    printf "  ${BOLD}%-4s %-22s %-18s %-10s %-6s${NC}\n" "#" "Partition" "GPU" "Time" "Nodes"
+    echo -e "  ${DIM}──── ────────────────────── ────────────────── ────────── ──────${NC}"
+
+    while IFS='|' read -r part gres timelimit nodes avail; do
+        [ "$avail" != "up" ] && continue
+        # Clean partition name (remove trailing *)
+        part="${part%\*}"
+        PARTITION_LIST+=("$part|$gres|$timelimit")
+        printf "  ${CYAN}%-4s${NC} %-22s %-18s %-10s %-6s\n" "[$idx]" "$part" "$gres" "$timelimit" "$nodes"
+        ((idx++))
+    done <<< "$PINFO"
+
+    echo ""
+}
+
+# ─── Show saved templates ────────────────────────────────────
+show_templates() {
+    local templates=($(ls "$JOBS_DIR"/*.sh 2>/dev/null))
+    if [ ${#templates[@]} -eq 0 ]; then
+        return 1
+    fi
+
+    echo -e "${BOLD}Saved Job Templates${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    TEMPLATE_LIST=()
+    local idx=1
+    for t in "${templates[@]}"; do
+        local name=$(basename "$t" .sh)
+        local part=$(grep '#SBATCH.*--partition' "$t" 2>/dev/null | sed 's/.*=//;s/ .*//')
+        local gpus=$(grep '#SBATCH.*--gpus' "$t" 2>/dev/null | sed 's/.*=//;s/ .*//')
+        local time=$(grep '#SBATCH.*--time' "$t" 2>/dev/null | sed 's/.*=//;s/ .*//')
+        local mem=$(grep '#SBATCH.*--mem' "$t" 2>/dev/null | sed 's/.*=//;s/ .*//')
+
+        TEMPLATE_LIST+=("$t")
+        printf "  ${CYAN}[%d]${NC} ${BOLD}%-18s${NC} %s  gpu=%s  mem=%s  time=%s\n" \
+            "$idx" "$name" "$part" "$gpus" "$mem" "$time"
+        ((idx++))
+    done
+
+    echo ""
+    return 0
+}
+
+# ─── Build a new job interactively ───────────────────────────
+build_job() {
+    echo -e "\n${BOLD}Build a New Job${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    # Partition selection
+    if [ ${#PARTITION_LIST[@]} -gt 0 ]; then
+        echo -en "  ${BOLD}?${NC} Select partition number or type name: "
+        read -r input
+        if [[ "$input" =~ ^[0-9]+$ ]] && [ "$input" -ge 1 ] && [ "$input" -le ${#PARTITION_LIST[@]} ]; then
+            local pdata="${PARTITION_LIST[$((input-1))]}"
+            JOB_PARTITION=$(echo "$pdata" | cut -d'|' -f1)
+            local pgres=$(echo "$pdata" | cut -d'|' -f2)
+            local ptime=$(echo "$pdata" | cut -d'|' -f3)
+        else
+            JOB_PARTITION="$input"
+            pgres=""
+            ptime=""
+        fi
+    else
+        echo -en "  ${BOLD}?${NC} Partition: "
+        read -r JOB_PARTITION
+    fi
+
+    echo -en "  ${BOLD}?${NC} Job name [research]: "
+    read -r input; JOB_NAME="${input:-research}"
+
+    echo -en "  ${BOLD}?${NC} GPUs [1]: "
+    read -r input; JOB_GPUS="${input:-1}"
+
+    echo -en "  ${BOLD}?${NC} CPUs per task [8]: "
+    read -r input; JOB_CPUS="${input:-8}"
+
+    echo -en "  ${BOLD}?${NC} Memory [64gb]: "
+    read -r input; JOB_MEM="${input:-64gb}"
+
+    echo -en "  ${BOLD}?${NC} Time limit [${ptime:-1-00:00:00}]: "
+    read -r input; JOB_TIME="${input:-${ptime:-1-00:00:00}}"
+
+    echo -en "  ${BOLD}?${NC} Email for notifications (blank to skip): "
+    read -r JOB_EMAIL
+
+    echo ""
+    echo -e "  ${BOLD}Post-start command:${NC}"
+    echo -e "  ${DIM}  This runs after the job starts. Examples:${NC}"
+    echo -e "  ${DIM}    bash ~/serve_vllm.sh${NC}"
+    echo -e "  ${DIM}    jupyter lab --port 8888${NC}"
+    echo -e "  ${DIM}    sleep 1d  (just hold the allocation)${NC}"
+    echo -en "  ${BOLD}?${NC} Command [sleep 1d]: "
+    read -r input; JOB_CMD="${input:-sleep 1d}"
+
+    # Generate script
+    local SCRIPT_CONTENT="#!/bin/bash
+#SBATCH --job-name=${JOB_NAME}
+#SBATCH --partition=${JOB_PARTITION}
+#SBATCH --nodes=1
+#SBATCH --gpus=${JOB_GPUS}
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=${JOB_CPUS}
+#SBATCH --mem=${JOB_MEM}
+#SBATCH --time=${JOB_TIME}
+#SBATCH --output=${JOB_NAME}-%j.log"
+
+    if [ -n "$JOB_EMAIL" ]; then
+        SCRIPT_CONTENT+="
+#SBATCH --mail-user=${JOB_EMAIL}
+#SBATCH --mail-type=BEGIN,END,FAIL"
+    fi
+
+    SCRIPT_CONTENT+="
+
+echo \"============================================\"
+echo \"Node: \$(hostname)\"
+echo \"Job ID: \$SLURM_JOB_ID\"
+echo \"Started: \$(date)\"
+echo \"GPUs: ${JOB_GPUS}\"
+echo \"============================================\"
+
+${JOB_CMD}"
+
+    echo ""
+    echo -e "  ${BOLD}Job script preview:${NC}"
+    echo -e "${DIM}"
+    echo "$SCRIPT_CONTENT" | sed 's/^/    /'
+    echo -e "${NC}"
+
+    # Save template
+    echo -en "  ${BOLD}?${NC} Save as template? Name (blank to skip): "
+    read -r tmpl_name
+    if [ -n "$tmpl_name" ]; then
+        echo "$SCRIPT_CONTENT" > "$JOBS_DIR/${tmpl_name}.sh"
+        chmod +x "$JOBS_DIR/${tmpl_name}.sh"
+        ok "Template saved: $JOBS_DIR/${tmpl_name}.sh"
+    fi
+
+    JOB_SCRIPT_CONTENT="$SCRIPT_CONTENT"
+}
+
+# ─── Submit and connect ──────────────────────────────────────
+submit_and_connect() {
+    local SCRIPT_PATH="$1"
+    local SCRIPT_CONTENT="$2"
+
+    echo -e "\n${BOLD}Submitting Job${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    local REMOTE_SCRIPT
+    if [ -n "$SCRIPT_PATH" ] && [ -f "$SCRIPT_PATH" ]; then
+        # Upload local template to HPC
+        REMOTE_SCRIPT="/tmp/hpc-job-$$.sh"
+        scp -o ConnectTimeout=10 -q "$SCRIPT_PATH" "${HPC_JUMP}:${REMOTE_SCRIPT}" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            fail "Could not upload job script"
+            exit 1
+        fi
+    elif [ -n "$SCRIPT_CONTENT" ]; then
+        REMOTE_SCRIPT="/tmp/hpc-job-$$.sh"
+        echo "$SCRIPT_CONTENT" | ssh -o ConnectTimeout=10 "$HPC_JUMP" "cat > $REMOTE_SCRIPT && chmod +x $REMOTE_SCRIPT" 2>/dev/null
+    elif [ -n "$SLURM_JOB_SCRIPT" ]; then
+        REMOTE_SCRIPT="$SLURM_JOB_SCRIPT"
+    else
+        fail "No job script specified"
+        exit 1
+    fi
+
+    info "Submitting: sbatch $REMOTE_SCRIPT"
+    local SUBMIT_OUTPUT
+    SUBMIT_OUTPUT=$(hpc_ssh "sbatch $REMOTE_SCRIPT 2>&1")
+    local JOB_ID
+    JOB_ID=$(echo "$SUBMIT_OUTPUT" | grep -oP '\d+' | tail -1)
+
+    if [ -z "$JOB_ID" ]; then
+        fail "sbatch failed: $SUBMIT_OUTPUT"
+        exit 1
+    fi
+    ok "Job submitted: $JOB_ID"
+
+    # Poll for allocation
+    info "Waiting for node allocation..."
+    local JOB_NODE=""
+    for i in $(seq 1 180); do
+        local POLL
+        POLL=$(hpc_ssh "squeue -j $JOB_ID -h -o '%T %N' 2>/dev/null" | head -1)
+        local STATE=$(echo "$POLL" | awk '{print $1}')
+        local NODE=$(echo "$POLL" | awk '{print $2}')
+
+        if [ "$STATE" = "RUNNING" ] && [ -n "$NODE" ]; then
+            JOB_NODE="$NODE"
+            ok "Running on $JOB_NODE (waited $((i*5))s)"
+            break
+        fi
+
+        # Progress
+        if (( i % 6 == 0 )); then
+            echo -e "  ${DIM}... ${i}×5s elapsed, state: ${STATE:-QUEUED}${NC}"
+        fi
+        sleep 5
+    done
+
+    if [ -z "$JOB_NODE" ]; then
+        fail "Timed out waiting for allocation (15 min)"
+        echo -e "  ${DIM}Job $JOB_ID may still be queued. Check: ssh $HPC_JUMP squeue -j $JOB_ID${NC}"
+        exit 1
+    fi
+
+    # Connect tunnels
+    echo ""
+    info "Connecting tunnels to $JOB_NODE..."
+    local HPC_NODE_CMD="$HOME/.local/bin/hpc-node"
+    if [ -x "$HPC_NODE_CMD" ]; then
+        "$HPC_NODE_CMD" "$JOB_NODE"
+    else
+        sed -i "s/^HPC_NODE=.*/HPC_NODE=${JOB_NODE}/" "$CONF"
+        systemctl --user restart hpc-tunnel-forward 2>/dev/null
+        sleep 3
+        systemctl --user restart hpc-tunnel-reverse 2>/dev/null || true
+    fi
+
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║${NC}  ${BOLD}Job running — tunnels connected!${NC}               ${GREEN}║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  Job:   ${BOLD}$JOB_ID${NC}"
+    echo -e "  Node:  ${BOLD}$JOB_NODE${NC}"
+    source "$CONF"
+    echo -e "  Ports: localhost:${LLM_PORT} → ${JOB_NODE}:${HPC_LLM_PORT}"
+    echo -e "         localhost:${ASR_PORT} → ${JOB_NODE}:${HPC_ASR_PORT}"
+    echo -e "         localhost:${TTS_PORT} → ${JOB_NODE}:${HPC_TTS_PORT}"
+    [ -n "$WORKSTATION" ] && echo -e "  Workstation: ${WORKSTATION} (reverse tunnel)"
+    echo ""
+}
+
+# ─── Main Menu ───────────────────────────────────────────────
+main_menu() {
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}  ${BOLD}hpc-job${NC} — SLURM Job Builder                     ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
+
+    check_access
+
+    show_running
+
+    local HAS_TEMPLATES=false
+    if show_templates; then
+        HAS_TEMPLATES=true
+    fi
+
+    show_partitions
+
+    echo -e "${BOLD}What do you want to do?${NC}"
+    echo ""
+    if [ "$HAS_TEMPLATES" = true ]; then
+        echo -e "  ${CYAN}[T]${NC} Submit a saved template"
+    fi
+    echo -e "  ${CYAN}[N]${NC} Build a new job"
+    if [ -n "$SLURM_JOB_SCRIPT" ]; then
+        echo -e "  ${CYAN}[R]${NC} Re-submit last job ($SLURM_JOB_SCRIPT)"
+    fi
+    echo -e "  ${CYAN}[C]${NC} Connect to existing running job"
+    echo -e "  ${CYAN}[Q]${NC} Quit"
+    echo ""
+    echo -en "  ${BOLD}?${NC} Choice: "
+    read -r choice
+
+    case "${choice^^}" in
+        T)
+            if [ "$HAS_TEMPLATES" != true ]; then
+                fail "No saved templates"
+                exit 1
+            fi
+            echo -en "  ${BOLD}?${NC} Template number: "
+            read -r tnum
+            if [[ "$tnum" =~ ^[0-9]+$ ]] && [ "$tnum" -ge 1 ] && [ "$tnum" -le ${#TEMPLATE_LIST[@]} ]; then
+                local selected="${TEMPLATE_LIST[$((tnum-1))]}"
+                ok "Selected: $(basename "$selected" .sh)"
+                submit_and_connect "$selected" ""
+            else
+                fail "Invalid selection"
+                exit 1
+            fi
+            ;;
+        N)
+            build_job
+            submit_and_connect "" "$JOB_SCRIPT_CONTENT"
+            ;;
+        R)
+            if [ -z "$SLURM_JOB_SCRIPT" ]; then
+                fail "No last job script configured"
+                exit 1
+            fi
+            submit_and_connect "" ""
+            ;;
+        C)
+            echo -en "  ${BOLD}?${NC} Job ID or node name: "
+            read -r input
+            if [[ "$input" =~ ^[0-9]+$ ]]; then
+                # Job ID — find the node
+                local NODE
+                NODE=$(hpc_ssh "squeue -j $input -h -o '%N' 2>/dev/null" | head -1)
+                if [ -z "$NODE" ]; then
+                    fail "Job $input not found or not running"
+                    exit 1
+                fi
+                info "Job $input is on $NODE"
+                input="$NODE"
+            fi
+            "$HOME/.local/bin/hpc-node" "$input"
+            ;;
+        Q|"")
+            echo "Bye!"
+            ;;
+        *)
+            fail "Unknown choice: $choice"
+            ;;
+    esac
+}
+
+# ─── CLI args ────────────────────────────────────────────────
+case "${1:-}" in
+    --submit|-s)
+        # Direct submit: hpc-job --submit template_name
+        check_access
+        TMPL="$JOBS_DIR/${2}.sh"
+        if [ ! -f "$TMPL" ]; then
+            fail "Template not found: $2"
+            echo "Available: $(ls "$JOBS_DIR"/*.sh 2>/dev/null | xargs -I{} basename {} .sh | tr '\n' ' ')"
+            exit 1
+        fi
+        submit_and_connect "$TMPL" ""
+        ;;
+    --new|-n)
+        check_access
+        show_partitions
+        build_job
+        submit_and_connect "" "$JOB_SCRIPT_CONTENT"
+        ;;
+    --list|-l)
+        show_templates || echo "No templates. Create one with: hpc-job --new"
+        ;;
+    --help|-h)
+        cat << 'EOF'
+hpc-job — Interactive SLURM job builder
+
+USAGE:
+    hpc-job                  Interactive menu
+    hpc-job --new            Build and submit a new job
+    hpc-job --submit NAME    Submit a saved template
+    hpc-job --list           List saved templates
+    hpc-job --help           Show this help
+
+TEMPLATES:
+    Saved in ~/.config/hpc-jobs/
+    Create via the interactive menu or --new
+EOF
+        ;;
+    *)
+        main_menu
+        ;;
+esac

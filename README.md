@@ -1,19 +1,44 @@
 # SupercomputerReconnect
 
-Persistent SSH tunnels to HPC compute nodes that survive daily SLURM job changes. Full automation: VPN → job submission → tunnel setup — one command.
+**One command to rule them all: VPN → SLURM → Tunnels.**
 
-Built for researchers who run services (LLM inference, ASR, TTS, Jupyter, etc.) on HPC nodes that change every day when jobs are resubmitted.
+Persistent SSH tunnels to HPC compute nodes that survive daily SLURM job changes. Full automation from VPN authentication to job submission to port forwarding — with an interactive job builder.
 
-## The Problem
+Built by and for researchers running GPU workloads on university HPC clusters (HiPerGator, etc.) who are tired of the daily reconnect dance.
 
-HPC jobs land on different compute nodes each time. You SSH in, set up port forwards, and when the job expires and you resubmit — everything breaks. You redo the tunnels manually. Every. Single. Day. And first you have to reauth your campus VPN.
-
-## The Solution
+## Quick Start
 
 ```bash
-# Morning routine — one command does everything:
-hpc-reconnect
+git clone https://github.com/AndreTregear/SupercomputerReconnect.git
+cd SupercomputerReconnect
+bash hpc-setup
 ```
+
+The interactive wizard walks you through everything:
+1. Generates an SSH keypair and shows you what to paste on the login node
+2. Tests the connection live
+3. Configures port forwarding
+4. Sets up EduVPN auto-authentication (optional)
+5. Creates SLURM job templates
+6. Installs systemd services for persistent tunnels
+
+## Daily Workflow
+
+```bash
+# Morning: one command does everything
+hpc-reconnect
+
+# Or: submit a new job interactively
+hpc-job
+
+# Job landed on a new node? Switch tunnels:
+hpc-node c1101a-s17
+
+# Let it figure out the node:
+hpc-node --auto
+```
+
+## What `hpc-reconnect` Does
 
 ```
 [1/4] Checking VPN...
@@ -37,10 +62,36 @@ hpc-reconnect
   TTS:   localhost:18083
 ```
 
-Or switch nodes manually:
-```bash
-hpc-node c1101a-s17        # switch to specific node
-hpc-node --auto             # auto-detect from SLURM
+## What `hpc-job` Does
+
+```
+╔══════════════════════════════════════════════════╗
+║  hpc-job — SLURM Job Builder                     ║
+╚══════════════════════════════════════════════════╝
+
+Current Jobs
+────────────────────────────────────────
+  29015496  hpg-b200   research     RUNNING  8:56:50  c1100a-s15
+
+Saved Job Templates
+────────────────────────────────────────
+  [1] gpu-1day          hpg-b200  gpu=1  mem=64gb  time=1-00:00:00
+  [2] dev-2hr           hpg-dev   gpu=1  mem=32gb  time=2:00:00
+
+Available Partitions
+────────────────────────────────────────
+  #    Partition              GPU                Time       Nodes
+  [1]  hpg-b200              gres:gpu:b200:4    1-00:00:00 12
+  [2]  hpg-ai                gres:gpu:a100:8    7-00:00:00 45
+  ...
+
+What do you want to do?
+
+  [T] Submit a saved template
+  [N] Build a new job
+  [R] Re-submit last job
+  [C] Connect to existing running job
+  [Q] Quit
 ```
 
 ## Architecture
@@ -55,102 +106,76 @@ hpc-node --auto             # auto-detect from SLURM
    (ProxyJump)
         ↑
    [EduVPN]  ← auto-authenticated via Playwright
+              (WAYF → CAS/Shibboleth → Duo MFA → callback)
 ```
 
-**Pipeline stages:**
-1. **VPN** — Checks EduVPN, auto-reconnects (silent refresh or Playwright browser automation)
-2. **HPC** — Verifies jump host is reachable
-3. **SLURM** — Detects running jobs or submits a new one, waits for node allocation
-4. **Tunnels** — Systemd services with auto-reconnect, optional reverse tunnel to workstation
+## Commands
 
-## Install
+| Command | Description |
+|---------|-------------|
+| `hpc-setup` | Interactive first-run wizard |
+| `hpc-reconnect` | Full pipeline: VPN → job → tunnels |
+| `hpc-job` | Interactive SLURM job builder |
+| `hpc-job --new` | Build a new job directly |
+| `hpc-job --submit NAME` | Submit a saved template |
+| `hpc-job --list` | List saved templates |
+| `hpc-node` | Show current node and status |
+| `hpc-node NODE` | Switch to a specific node |
+| `hpc-node --auto` | Auto-detect from SLURM |
+| `hpc-node --stop` | Stop all tunnels |
 
-```bash
-git clone https://github.com/AndreTregear/SupercomputerReconnect.git
-cd SupercomputerReconnect
-bash install.sh
-```
+## EduVPN Auto-Authentication
 
-### Requirements
+When your VPN session expires, `hpc-reconnect` handles the full re-auth automatically:
 
-- Linux with systemd (Debian, Ubuntu, Fedora, etc.)
-- SSH access to HPC jump host + compute nodes
-- Node.js + npm (for EduVPN browser automation)
-- `eduvpn-cli` (if your HPC requires EduVPN)
+1. Tries silent reconnect (OAuth refresh token)
+2. If expired, launches headless Chromium via Playwright
+3. Navigates InCommon WAYF → selects your university
+4. Completes Shibboleth/CAS login
+5. Waits for Duo MFA push (you approve on your phone)
+6. Clicks through device trust and attribute consent
+7. OAuth callback completes → VPN connected
 
-### What the installer does
-
-1. Asks for HPC connection details (jump host, user, key, ports)
-2. Optionally configures a remote workstation for reverse tunnels
-3. Optionally sets up EduVPN auto-authentication (credentials stored locally in `~/.config/hpc-tunnel.env`, mode 600)
-4. Installs `hpc-node` and `hpc-reconnect` to `~/.local/bin/`
-5. Sets up systemd user services for persistent tunnels
-6. Installs Playwright + Chromium for headless VPN auth
-
-## Usage
-
-### Full pipeline
-```bash
-hpc-reconnect               # VPN → job → tunnels, all automatic
-```
-
-### Tunnel management
-```bash
-hpc-node                    # Show current node and tunnel status
-hpc-node c1100a-s15         # Switch to a specific node
-hpc-node --auto             # Auto-detect node from SLURM queue
-hpc-node --start            # Start tunnels
-hpc-node --stop             # Stop tunnels
-hpc-node --restart          # Restart tunnels
-hpc-node --status           # Show systemd service status
-```
+**Supported auth flows:**
+- InCommon WAYF federation discovery
+- Shibboleth / CAS / SAML IdPs
+- Duo MFA (push notification)
+- Attribute consent pages
 
 ## Configuration
 
-### Connection config: `~/.config/hpc-tunnel.conf`
+### `~/.config/hpc-tunnel.conf`
+Connection settings (no secrets).
 
-```ini
-HPC_NODE=c1100a-s15
-HPC_USER=username
-HPC_JUMP=myjumphost
-HPC_KEY=/home/user/.ssh/id_ed25519
-SLURM_JOB_SCRIPT=/home/username/my_job.sh
-WORKSTATION=my.workstation.com
-WORKSTATION_USER=me
-WORKSTATION_KEY=/home/user/.ssh/id_ed25519
-LLM_PORT=18080
-ASR_PORT=18082
-TTS_PORT=18083
-HPC_LLM_PORT=8080
-HPC_ASR_PORT=8082
-HPC_TTS_PORT=8083
-```
+### `~/.config/hpc-tunnel.env`
+IdP credentials for VPN auto-auth (mode 600, gitignored).
 
-### Credentials: `~/.config/hpc-tunnel.env`
+### `~/.config/hpc-jobs/`
+Saved SLURM job templates.
 
-```ini
-# Created by install.sh, mode 600, never committed
-IDP_USER=youruser
-IDP_PASS=yourpassword
-```
+## Requirements
 
-## How EduVPN auto-auth works
-
-1. `hpc-reconnect` checks if EduVPN is connected
-2. If not, tries `eduvpn-cli connect` (uses cached refresh token — no browser needed)
-3. If the refresh token is expired, starts `eduvpn-cli renew`, captures the OAuth URL, and launches a headless Chromium via Playwright to complete the Shibboleth/SAML login automatically
-4. The IdP callback hits the local loopback server and eduvpn-cli completes the token exchange
+- Linux with systemd (Debian, Ubuntu, Fedora, etc.)
+- SSH access to HPC
+- Node.js (for EduVPN browser automation)
+- `eduvpn-cli` (if your HPC requires EduVPN)
 
 ## Uninstall
 
 ```bash
-systemctl --user disable --now hpc-tunnel-forward hpc-tunnel-reverse
-rm ~/.local/bin/hpc-node ~/.local/bin/hpc-reconnect ~/.local/bin/hpc-tunnel-*.sh
+hpc-node --stop
+systemctl --user disable hpc-tunnel-forward hpc-tunnel-reverse 2>/dev/null
+rm -f ~/.local/bin/hpc-{node,reconnect,job,setup,tunnel-*}
 rm -rf ~/.local/share/hpc-reconnect
-rm ~/.config/systemd/user/hpc-tunnel-*.service
-rm ~/.config/hpc-tunnel.conf ~/.config/hpc-tunnel.env
+rm -f ~/.config/systemd/user/hpc-tunnel-*.service
+rm -f ~/.config/hpc-tunnel.{conf,env}
+rm -rf ~/.config/hpc-jobs
 systemctl --user daemon-reload
 ```
+
+## Contributing
+
+PRs welcome! This tool was built for HiPerGator but should work with any SLURM-based HPC with SSH access.
 
 ## License
 

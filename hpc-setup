@@ -1,0 +1,445 @@
+#!/bin/bash
+# hpc-setup — Interactive first-run wizard for SupercomputerReconnect
+# Generates SSH keys, tests connections, configures everything.
+
+set -o pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+CONF="$HOME/.config/hpc-tunnel.conf"
+ENV_FILE="$HOME/.config/hpc-tunnel.env"
+BIN_DIR="$HOME/.local/bin"
+SYSTEMD_DIR="$HOME/.config/systemd/user"
+SHARE_DIR="$HOME/.local/share/hpc-reconnect"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+JOBS_DIR="$HOME/.config/hpc-jobs"
+
+banner() {
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}  ${BOLD}SupercomputerReconnect${NC} — Setup Wizard           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${DIM}Persistent tunnels to HPC compute nodes${NC}         ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+ok()    { echo -e "  ${GREEN}✓${NC} $1"; }
+fail()  { echo -e "  ${RED}✗${NC} $1"; }
+warn()  { echo -e "  ${YELLOW}!${NC} $1"; }
+info()  { echo -e "  ${CYAN}→${NC} $1"; }
+ask()   { echo -en "  ${BOLD}?${NC} $1"; }
+
+# ─── Step 1: SSH Key Generation ──────────────────────────────
+setup_ssh_key() {
+    echo -e "\n${BOLD}Step 1: SSH Key${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    local KEY_PATH="$HOME/.ssh/hpc_ed25519"
+
+    if [ -f "$KEY_PATH" ]; then
+        ok "SSH key already exists: $KEY_PATH"
+        ask "Generate a new one? [y/N] "
+        read -r yn
+        if [[ ! "$yn" =~ ^[Yy] ]]; then
+            HPC_KEY="$KEY_PATH"
+            return
+        fi
+    fi
+
+    ask "Key path [$KEY_PATH]: "
+    read -r input
+    KEY_PATH="${input:-$KEY_PATH}"
+
+    echo ""
+    info "Generating ed25519 keypair..."
+    ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" -C "$(whoami)@supercomputer-reconnect" -q
+    ok "Key generated: $KEY_PATH"
+
+    echo ""
+    echo -e "  ${BOLD}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "  ${BOLD}║ COPY THIS PUBLIC KEY TO YOUR HPC LOGIN NODE:    ║${NC}"
+    echo -e "  ${BOLD}╚══════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${YELLOW}$(cat "${KEY_PATH}.pub")${NC}"
+    echo ""
+    echo -e "  ${DIM}On the HPC login node, run:${NC}"
+    echo -e "  ${CYAN}mkdir -p ~/.ssh && echo '$(cat "${KEY_PATH}.pub")' >> ~/.ssh/authorized_keys${NC}"
+    echo ""
+
+    ask "Press Enter once you've added the key to the HPC..."
+    read -r
+
+    HPC_KEY="$KEY_PATH"
+}
+
+# ─── Step 2: HPC Connection ─────────────────────────────────
+setup_hpc() {
+    echo -e "\n${BOLD}Step 2: HPC Connection${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    ask "HPC login/jump host (hostname or IP): "
+    read -r HPC_JUMP_HOST
+    if [ -z "$HPC_JUMP_HOST" ]; then
+        fail "Jump host is required"
+        exit 1
+    fi
+
+    ask "HPC username: "
+    read -r HPC_USER
+    if [ -z "$HPC_USER" ]; then
+        fail "Username is required"
+        exit 1
+    fi
+
+    ask "SSH port [22]: "
+    read -r HPC_PORT
+    HPC_PORT="${HPC_PORT:-22}"
+
+    # Create SSH config alias
+    local SSH_CONF="$HOME/.ssh/config"
+    local JUMP_ALIAS="hpc-jump"
+
+    # Check if alias already exists
+    if grep -q "^Host $JUMP_ALIAS$" "$SSH_CONF" 2>/dev/null; then
+        warn "SSH alias '$JUMP_ALIAS' already exists in config"
+    else
+        info "Adding SSH alias '$JUMP_ALIAS' to $SSH_CONF..."
+        mkdir -p "$HOME/.ssh"
+        cat >> "$SSH_CONF" << EOF
+
+# Added by SupercomputerReconnect
+Host $JUMP_ALIAS
+    HostName $HPC_JUMP_HOST
+    User $HPC_USER
+    Port $HPC_PORT
+    IdentityFile $HPC_KEY
+EOF
+        chmod 600 "$SSH_CONF"
+        ok "SSH alias created"
+    fi
+
+    HPC_JUMP="$JUMP_ALIAS"
+
+    # Live test
+    echo ""
+    info "Testing SSH connection to $HPC_JUMP_HOST..."
+    if ssh -o ConnectTimeout=15 -o BatchMode=yes -i "$HPC_KEY" -p "$HPC_PORT" "${HPC_USER}@${HPC_JUMP_HOST}" "echo ok" >/dev/null 2>&1; then
+        ok "Connection successful!"
+    else
+        fail "Connection failed."
+        echo ""
+        echo -e "  ${DIM}Common issues:${NC}"
+        echo -e "  ${DIM}  - Public key not added to ~/.ssh/authorized_keys on HPC${NC}"
+        echo -e "  ${DIM}  - VPN not connected (EduVPN, GlobalProtect, etc.)${NC}"
+        echo -e "  ${DIM}  - Wrong hostname, username, or port${NC}"
+        echo ""
+        ask "Continue anyway? [y/N] "
+        read -r yn
+        if [[ ! "$yn" =~ ^[Yy] ]]; then exit 1; fi
+    fi
+}
+
+# ─── Step 3: Port Forwarding ────────────────────────────────
+setup_ports() {
+    echo -e "\n${BOLD}Step 3: Port Forwarding${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+    echo -e "  ${DIM}Configure which services to forward from the compute node.${NC}"
+    echo -e "  ${DIM}Format: LOCAL_PORT:REMOTE_PORT${NC}"
+    echo ""
+
+    ask "Service 1 name [LLM]: "
+    read -r input; SVC1_NAME="${input:-LLM}"
+    ask "  Ports [18080:8080]: "
+    read -r input; IFS=: read -r LLM_PORT HPC_LLM_PORT <<< "${input:-18080:8080}"
+
+    ask "Service 2 name [ASR]: "
+    read -r input; SVC2_NAME="${input:-ASR}"
+    ask "  Ports [18082:8082]: "
+    read -r input; IFS=: read -r ASR_PORT HPC_ASR_PORT <<< "${input:-18082:8082}"
+
+    ask "Service 3 name [TTS]: "
+    read -r input; SVC3_NAME="${input:-TTS}"
+    ask "  Ports [18083:8083]: "
+    read -r input; IFS=: read -r TTS_PORT HPC_TTS_PORT <<< "${input:-18083:8083}"
+
+    ok "Ports configured"
+}
+
+# ─── Step 4: Remote Workstation ──────────────────────────────
+setup_workstation() {
+    echo -e "\n${BOLD}Step 4: Remote Workstation (optional)${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+    echo -e "  ${DIM}Expose HPC services on a remote machine via reverse tunnel.${NC}"
+    echo ""
+
+    ask "Workstation hostname (blank to skip): "
+    read -r WORKSTATION
+
+    if [ -n "$WORKSTATION" ]; then
+        ask "Workstation user [$(whoami)]: "
+        read -r input; WORKSTATION_USER="${input:-$(whoami)}"
+
+        ask "Workstation SSH key [$HOME/.ssh/id_ed25519]: "
+        read -r input; WORKSTATION_KEY="${input:-$HOME/.ssh/id_ed25519}"
+
+        # Test workstation connection
+        info "Testing workstation connection..."
+        if ssh -o ConnectTimeout=10 -o BatchMode=yes -i "$WORKSTATION_KEY" "${WORKSTATION_USER}@${WORKSTATION}" "echo ok" >/dev/null 2>&1; then
+            ok "Workstation reachable"
+        else
+            warn "Could not connect — you may need to set up SSH keys separately"
+        fi
+    else
+        WORKSTATION_USER=""
+        WORKSTATION_KEY=""
+    fi
+}
+
+# ─── Step 5: EduVPN ─────────────────────────────────────────
+setup_vpn() {
+    echo -e "\n${BOLD}Step 5: VPN Auto-Authentication (optional)${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    if ! command -v eduvpn-cli &>/dev/null; then
+        warn "eduvpn-cli not found — skipping VPN setup"
+        return
+    fi
+
+    ask "Enable EduVPN auto-auth? [y/N] "
+    read -r yn
+    if [[ ! "$yn" =~ ^[Yy] ]]; then return; fi
+
+    echo ""
+    echo -e "  ${DIM}Your IdP (university) credentials for Shibboleth/CAS login.${NC}"
+    echo -e "  ${DIM}Stored locally in $ENV_FILE (mode 600, never committed).${NC}"
+    echo ""
+
+    ask "IdP organization name [Florida State University]: "
+    read -r input; IDP_NAME="${input:-Florida State University}"
+
+    ask "IdP username: "
+    read -r IDP_USER
+
+    ask "IdP password: "
+    read -rs IDP_PASS
+    echo ""
+
+    # Write secrets
+    mkdir -p "$(dirname "$ENV_FILE")"
+    cat > "$ENV_FILE" << EOF
+# Credentials for hpc-reconnect (NEVER commit this file)
+IDP_USER='$IDP_USER'
+IDP_PASS='$IDP_PASS'
+IDP_NAME='$IDP_NAME'
+EOF
+    chmod 600 "$ENV_FILE"
+    ok "Credentials saved to $ENV_FILE"
+}
+
+# ─── Step 6: SLURM Job Templates ────────────────────────────
+setup_jobs() {
+    echo -e "\n${BOLD}Step 6: SLURM Job Templates${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+    echo -e "  ${DIM}Detect available partitions and create job templates.${NC}"
+    echo ""
+
+    mkdir -p "$JOBS_DIR"
+
+    # Try to detect partitions
+    info "Querying SLURM partitions..."
+    local PARTITIONS
+    PARTITIONS=$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$HPC_JUMP" \
+        "sinfo -h -o '%P %G %l' 2>/dev/null" 2>/dev/null) || true
+
+    if [ -n "$PARTITIONS" ]; then
+        echo ""
+        echo -e "  ${BOLD}Available partitions:${NC}"
+        echo "$PARTITIONS" | while read -r part gres timelimit; do
+            printf "    ${CYAN}%-20s${NC} GPU: %-15s Time: %s\n" "$part" "$gres" "$timelimit"
+        done
+        echo ""
+    fi
+
+    ask "Path to your SLURM job script on HPC (blank to skip): "
+    read -r SLURM_JOB_SCRIPT
+
+    if [ -n "$SLURM_JOB_SCRIPT" ]; then
+        ok "Job script: $SLURM_JOB_SCRIPT"
+    fi
+
+    ask "Create a quick job template now? [Y/n] "
+    read -r yn
+    if [[ "$yn" =~ ^[Nn] ]]; then return; fi
+
+    echo ""
+    ask "Template name [gpu-1day]: "
+    read -r input; local TMPL_NAME="${input:-gpu-1day}"
+
+    ask "Partition [hpg-b200]: "
+    read -r input; local TMPL_PART="${input:-hpg-b200}"
+
+    ask "GPUs [1]: "
+    read -r input; local TMPL_GPUS="${input:-1}"
+
+    ask "CPUs per task [8]: "
+    read -r input; local TMPL_CPUS="${input:-8}"
+
+    ask "Memory [64gb]: "
+    read -r input; local TMPL_MEM="${input:-64gb}"
+
+    ask "Time limit [1-00:00:00]: "
+    read -r input; local TMPL_TIME="${input:-1-00:00:00}"
+
+    ask "Job name [research]: "
+    read -r input; local TMPL_JOBNAME="${input:-research}"
+
+    ask "Post-start command (e.g. 'bash ~/serve.sh') [sleep 1d]: "
+    read -r input; local TMPL_CMD="${input:-sleep 1d}"
+
+    cat > "$JOBS_DIR/${TMPL_NAME}.sh" << TMPLEOF
+#!/bin/bash
+#SBATCH --job-name=${TMPL_JOBNAME}
+#SBATCH --partition=${TMPL_PART}
+#SBATCH --nodes=1
+#SBATCH --gpus=${TMPL_GPUS}
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=${TMPL_CPUS}
+#SBATCH --mem=${TMPL_MEM}
+#SBATCH --time=${TMPL_TIME}
+#SBATCH --output=${TMPL_JOBNAME}-%j.log
+
+echo "============================================"
+echo "Node: \$(hostname)"
+echo "Job ID: \$SLURM_JOB_ID"
+echo "Started: \$(date)"
+echo "GPUs: ${TMPL_GPUS}"
+echo "============================================"
+
+${TMPL_CMD}
+TMPLEOF
+
+    ok "Template saved: $JOBS_DIR/${TMPL_NAME}.sh"
+}
+
+# ─── Step 7: Install ────────────────────────────────────────
+do_install() {
+    echo -e "\n${BOLD}Step 7: Installing${NC}"
+    echo -e "${DIM}────────────────────────────────────────${NC}"
+
+    mkdir -p "$BIN_DIR" "$SYSTEMD_DIR" "$SHARE_DIR" "$JOBS_DIR"
+
+    # Write config
+    mkdir -p "$(dirname "$CONF")"
+    cat > "$CONF" << EOF
+# SupercomputerReconnect config
+HPC_NODE=
+HPC_USER=$HPC_USER
+HPC_JUMP=$HPC_JUMP
+HPC_KEY=$HPC_KEY
+WORKSTATION=${WORKSTATION:-}
+WORKSTATION_USER=${WORKSTATION_USER:-}
+WORKSTATION_KEY=${WORKSTATION_KEY:-}
+SLURM_JOB_SCRIPT=${SLURM_JOB_SCRIPT:-}
+JOBS_DIR=$JOBS_DIR
+LLM_PORT=$LLM_PORT
+ASR_PORT=$ASR_PORT
+TTS_PORT=$TTS_PORT
+HPC_LLM_PORT=$HPC_LLM_PORT
+HPC_ASR_PORT=$HPC_ASR_PORT
+HPC_TTS_PORT=$HPC_TTS_PORT
+EOF
+
+    # Install scripts
+    for f in hpc-node hpc-reconnect hpc-job hpc-setup; do
+        if [ -f "$SCRIPT_DIR/$f" ]; then
+            install -m 755 "$SCRIPT_DIR/$f" "$BIN_DIR/$f"
+            ok "Installed $f"
+        fi
+    done
+
+    for f in hpc-tunnel-forward.sh hpc-tunnel-reverse.sh; do
+        if [ -f "$SCRIPT_DIR/$f" ]; then
+            install -m 755 "$SCRIPT_DIR/$f" "$BIN_DIR/$f"
+        fi
+    done
+
+    if [ -f "$SCRIPT_DIR/eduvpn-auth.js" ]; then
+        install -m 644 "$SCRIPT_DIR/eduvpn-auth.js" "$SHARE_DIR/eduvpn-auth.js"
+    fi
+
+    # Systemd services
+    for f in hpc-tunnel-forward.service hpc-tunnel-reverse.service; do
+        if [ -f "$SCRIPT_DIR/$f" ]; then
+            cp "$SCRIPT_DIR/$f" "$SYSTEMD_DIR/"
+        fi
+    done
+
+    loginctl enable-linger "$(whoami)" 2>/dev/null || true
+    systemctl --user daemon-reload
+    systemctl --user enable hpc-tunnel-forward 2>/dev/null || true
+    if [ -n "$WORKSTATION" ]; then
+        systemctl --user enable hpc-tunnel-reverse 2>/dev/null || true
+    fi
+
+    # Install Playwright
+    if command -v node &>/dev/null; then
+        info "Installing Playwright..."
+        (cd "$SHARE_DIR" && npm init -y >/dev/null 2>&1 && npm install playwright 2>&1 | tail -1)
+        npx playwright install chromium 2>&1 | tail -1
+        ok "Playwright ready"
+    fi
+
+    # PATH check
+    if ! echo "$PATH" | grep -q "$BIN_DIR"; then
+        echo ""
+        warn "Add ~/.local/bin to your PATH:"
+        echo -e "    ${CYAN}echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc && source ~/.bashrc${NC}"
+    fi
+}
+
+# ─── Summary ─────────────────────────────────────────────────
+summary() {
+    echo ""
+    echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║${NC}  ${BOLD}Setup Complete!${NC}                                ${GREEN}║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${BOLD}Commands:${NC}"
+    echo -e "    ${CYAN}hpc-reconnect${NC}     Full pipeline: VPN → job → tunnels"
+    echo -e "    ${CYAN}hpc-job${NC}           Interactive SLURM job builder"
+    echo -e "    ${CYAN}hpc-node${NC}          Switch compute nodes"
+    echo -e "    ${CYAN}hpc-node --auto${NC}   Auto-detect from SLURM"
+    echo ""
+    echo -e "  ${BOLD}Config:${NC}"
+    echo -e "    ${DIM}$CONF${NC}"
+    [ -f "$ENV_FILE" ] && echo -e "    ${DIM}$ENV_FILE (credentials)${NC}"
+    echo -e "    ${DIM}$JOBS_DIR/ (job templates)${NC}"
+    echo ""
+    echo -e "  ${BOLD}Quick start:${NC}"
+    echo -e "    ${CYAN}hpc-job${NC}           Submit a job and connect"
+    echo -e "    ${CYAN}hpc-reconnect${NC}     Reconnect to existing job"
+    echo ""
+}
+
+# ─── Main ────────────────────────────────────────────────────
+banner
+
+if [ -f "$CONF" ]; then
+    warn "Existing config found at $CONF"
+    ask "Re-run setup from scratch? [y/N] "
+    read -r yn
+    if [[ ! "$yn" =~ ^[Yy] ]]; then
+        echo "Run ${CYAN}hpc-job${NC} to submit a job or ${CYAN}hpc-reconnect${NC} to reconnect."
+        exit 0
+    fi
+fi
+
+setup_ssh_key
+setup_hpc
+setup_ports
+setup_workstation
+setup_vpn
+setup_jobs
+do_install
+summary
