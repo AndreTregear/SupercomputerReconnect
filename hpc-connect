@@ -62,8 +62,30 @@ setup_host() {
     echo -en "  ${BOLD}?${NC} SSH port [22]: "
     read -r input; TARGET_PORT="${input:-22}"
 
-    echo -en "  ${BOLD}?${NC} SSH ProxyCommand (blank for direct, e.g. 'cloudflared access ssh --hostname %h'): "
-    read -r TARGET_PROXY
+    echo ""
+    echo -e "  ${BOLD}Connection type:${NC}"
+    echo -e "    ${CYAN}[1]${NC} Direct SSH"
+    echo -e "    ${CYAN}[2]${NC} Cloudflare Tunnel (requires cloudflared)"
+    echo -e "    ${CYAN}[3]${NC} Custom ProxyCommand"
+    echo -en "  ${BOLD}?${NC} Choice [1]: "
+    read -r proxy_choice
+    TARGET_PROXY=""
+    case "${proxy_choice:-1}" in
+        2)
+            local CF_BIN=$(command -v cloudflared 2>/dev/null || echo "/usr/local/bin/cloudflared")
+            if [ -x "$CF_BIN" ]; then
+                TARGET_PROXY="$CF_BIN access ssh --hostname %h"
+                ok "Cloudflare Tunnel mode ($CF_BIN)"
+            else
+                fail "cloudflared not found. Install: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+                exit 1
+            fi
+            ;;
+        3)
+            echo -en "  ${BOLD}?${NC} ProxyCommand: "
+            read -r TARGET_PROXY
+            ;;
+    esac
 
     # ─── SSH Key ─────────────────────────────────────────────
     echo ""

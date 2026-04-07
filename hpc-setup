@@ -183,16 +183,45 @@ setup_workstation() {
         ask "Workstation SSH key [$HOME/.ssh/id_ed25519]: "
         read -r input; WORKSTATION_KEY="${input:-$HOME/.ssh/id_ed25519}"
 
+        echo ""
+        ask "Is the workstation behind a Cloudflare Tunnel? [y/N] "
+        read -r yn
+        WORKSTATION_PROXY=""
+        if [[ "$yn" =~ ^[Yy] ]]; then
+            if command -v cloudflared &>/dev/null; then
+                WORKSTATION_PROXY="cloudflared access ssh --hostname %h"
+                ok "Cloudflare Tunnel enabled (cloudflared found)"
+            else
+                warn "cloudflared not found in PATH"
+                ask "Path to cloudflared [/usr/local/bin/cloudflared]: "
+                read -r input
+                local CF_PATH="${input:-/usr/local/bin/cloudflared}"
+                if [ -x "$CF_PATH" ]; then
+                    WORKSTATION_PROXY="$CF_PATH access ssh --hostname %h"
+                    ok "Cloudflare Tunnel enabled"
+                else
+                    fail "$CF_PATH not found — skipping proxy"
+                fi
+            fi
+        else
+            ask "Custom SSH ProxyCommand? (blank for direct): "
+            read -r WORKSTATION_PROXY
+        fi
+
         # Test workstation connection
         info "Testing workstation connection..."
-        if ssh -o ConnectTimeout=10 -o BatchMode=yes -i "$WORKSTATION_KEY" "${WORKSTATION_USER}@${WORKSTATION}" "echo ok" >/dev/null 2>&1; then
+        local TEST_CMD="ssh -o ConnectTimeout=10 -o BatchMode=yes -i $WORKSTATION_KEY"
+        [ -n "$WORKSTATION_PROXY" ] && TEST_CMD="$TEST_CMD -o ProxyCommand='$WORKSTATION_PROXY'"
+        TEST_CMD="$TEST_CMD ${WORKSTATION_USER}@${WORKSTATION} echo ok"
+        if eval $TEST_CMD >/dev/null 2>&1; then
             ok "Workstation reachable"
         else
-            warn "Could not connect — you may need to set up SSH keys separately"
+            warn "Could not connect — check host, key, and proxy settings"
         fi
     else
         WORKSTATION_USER=""
         WORKSTATION_KEY=""
+        WORKSTATION_PROXY=""
     fi
 }
 
@@ -340,6 +369,7 @@ HPC_KEY=$HPC_KEY
 WORKSTATION=${WORKSTATION:-}
 WORKSTATION_USER=${WORKSTATION_USER:-}
 WORKSTATION_KEY=${WORKSTATION_KEY:-}
+WORKSTATION_PROXY='${WORKSTATION_PROXY:-}'
 SLURM_JOB_SCRIPT=${SLURM_JOB_SCRIPT:-}
 JOBS_DIR=$JOBS_DIR
 LLM_PORT=$LLM_PORT

@@ -1,5 +1,6 @@
 #!/bin/bash
 # Reverse tunnel: expose forwarded HPC ports on a remote workstation
+# Supports direct SSH, Cloudflare Tunnel, or any ProxyCommand
 source "$HOME/.config/hpc-tunnel.conf"
 
 # Build reverse port args from FORWARD_PORTS or legacy vars
@@ -22,12 +23,20 @@ if [ -z "$REVERSE_ARGS" ]; then
     exit 1
 fi
 
-exec /usr/bin/ssh -N \
+# Build SSH command
+SSH_CMD="/usr/bin/ssh -N \
     -o ServerAliveInterval=30 \
     -o ServerAliveCountMax=3 \
     -o ExitOnForwardFailure=yes \
     -o ConnectTimeout=15 \
     -o BatchMode=yes \
-    -i "$WORKSTATION_KEY" \
-    $REVERSE_ARGS \
-    "${WORKSTATION_USER}@${WORKSTATION}"
+    -i $WORKSTATION_KEY"
+
+# Add proxy if configured (Cloudflare Tunnel, etc.)
+if [ -n "$WORKSTATION_PROXY" ]; then
+    SSH_CMD="$SSH_CMD -o ProxyCommand='$WORKSTATION_PROXY'"
+fi
+
+SSH_CMD="$SSH_CMD $REVERSE_ARGS ${WORKSTATION_USER}@${WORKSTATION}"
+
+eval exec $SSH_CMD
