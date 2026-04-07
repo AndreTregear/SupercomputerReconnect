@@ -1,0 +1,6 @@
+[Unit]
+Description=Auto-renew EduVPN for HPC access
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/hpc-vpn-renew.sh

@@ -1,0 +1,12 @@
+[Unit]
+Description=HPC mesh routing daemon (primary/failover)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hpc-route daemon
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
