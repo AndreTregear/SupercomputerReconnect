@@ -40,11 +40,16 @@ STEPS=4
 step 1 "Checking VPN..."
 
 vpn_status() {
-    eduvpn-cli status 2>/dev/null | grep -q "Connected"
+    # eduvpn-cli exits 2 even when connected; ignore its exit code
+    local out
+    out=$(eduvpn-cli status 2>/dev/null) || true
+    echo "$out" | grep -q "Connected"
 }
 
 vpn_remaining() {
-    eduvpn-cli status 2>&1 | grep "Valid for" | sed 's/.*Valid for: //'
+    local out
+    out=$(eduvpn-cli status 2>/dev/null) || true
+    echo "$out" | grep "Valid for" | sed 's/.*Valid for: //'
 }
 
 if vpn_status; then
@@ -67,6 +72,7 @@ CAPTUREEOF
 
     # Connect with BROWSER capture — silent refresh if token valid,
     # otherwise captures the auth URL for Playwright
+    # -n 1 = reconnect to server #1 (first configured server)
     BROWSER="$CAPTURE_SCRIPT" eduvpn-cli connect -n 1 >/dev/null 2>&1 &
     CONNECT_PID=$!
 

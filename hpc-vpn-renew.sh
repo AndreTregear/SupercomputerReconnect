@@ -5,7 +5,8 @@ source "$HOME/.config/hpc-tunnel.env" 2>/dev/null
 SHARE="$HOME/.local/share/hpc-reconnect"
 
 # Check if VPN is connected and how much time remains
-STATUS=$(eduvpn-cli status 2>/dev/null)
+# eduvpn-cli exits 2 even when connected; ignore its exit code
+STATUS=$(eduvpn-cli status 2>/dev/null) || true
 if ! echo "$STATUS" | grep -q "Connected"; then
     echo "[vpn-renew] VPN disconnected — reconnecting..."
 elif echo "$STATUS" | grep -q "expired"; then
@@ -39,8 +40,9 @@ CONNECT_PID=$!
 # Wait for silent refresh or URL
 AUTH_URL=""
 for i in $(seq 1 15); do
-    if eduvpn-cli status 2>/dev/null | grep -q "Valid for:" && \
-       ! eduvpn-cli status 2>/dev/null | grep -q "expired"; then
+    vpn_out=$(eduvpn-cli status 2>/dev/null) || true
+    if echo "$vpn_out" | grep -q "Valid for:" && \
+       ! echo "$vpn_out" | grep -q "expired"; then
         echo "[vpn-renew] Reconnected via refresh token"
         kill $CONNECT_PID 2>/dev/null
         rm -f /tmp/capture-browser.sh /tmp/vpn-url.txt
