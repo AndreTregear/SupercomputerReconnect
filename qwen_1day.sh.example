@@ -1,0 +1,65 @@
+#!/bin/bash
+#SBATCH --job-name=research-omni
+#SBATCH --partition=hpg-b200
+#SBATCH --nodes=1
+#SBATCH --gpus=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64gb
+#SBATCH --time=1-00:00:00
+#SBATCH --output=research-omni-%j.log
+#SBATCH --mail-user=aat22g@fsu.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+
+export MYBLUE=/blue/xiuwenliu/aat22g.fsu
+export HF_HOME=$MYBLUE/hf_cache
+export VLLM_CACHE_ROOT=$MYBLUE/vllm_cache
+export TORCH_HOME=$MYBLUE/torch_cache
+mkdir -p "$HF_HOME" "$VLLM_CACHE_ROOT" "$TORCH_HOME"
+
+module load tmux/3.5
+export TERM=xterm-256color
+
+OMNI=$MYBLUE/yaya-omni
+NODE=$(hostname)
+SESSION="omni-${SLURM_JOB_ID}"
+
+echo "============================================"
+echo "Node: $NODE"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Started: $(date)"
+echo "GPU: 1x B200, 1-day allocation"
+echo ""
+echo "SSH tunnel:"
+echo "  ssh -N -L 18080:$NODE:8080 hpc"
+echo ""
+echo "Attach to tmux:"
+echo "  srun --jobid $SLURM_JOB_ID --pty bash -lc 'module load tmux/3.5; export TERM=xterm-256color; tmux attach -t $SESSION'"
+echo "============================================"
+
+# Create tmux session with all services
+tmux new-session -d -s "$SESSION" -n gpu0
+tmux send-keys -t "$SESSION:gpu0" "bash $OMNI/serve_gpu0_122b_spec.sh" C-m
+
+tmux new-window -t "$SESSION" -n asr
+tmux send-keys -t "$SESSION:asr" "bash $OMNI/serve_qwen_asr.sh" C-m
+
+tmux new-window -t "$SESSION" -n tts
+tmux send-keys -t "$SESSION:tts" "bash $OMNI/serve_qwen_tts.sh" C-m
+
+# Watchdog in its own window — monitors and restarts crashed services
+tmux new-window -t "$SESSION" -n watchdog
+tmux send-keys -t "$SESSION:watchdog" "bash $OMNI/hpc-watchdog.sh" C-m
+
+# Monitoring window
+tmux new-window -t "$SESSION" -n monitor
+tmux send-keys -t "$SESSION:monitor" "watch -n5 'nvidia-smi | grep MiB; echo; ss -tlnp | grep -E \"808[0-3]\"'" C-m
+
+echo "[$(date)] tmux session '$SESSION' created"
+echo "  gpu0:     Qwen3.5-122B LLM (no speculative decoding)"
+echo "  asr:      Qwen3-ASR-1.7B"
+echo "  tts:      Qwen3-TTS-1.7B"
+echo "  watchdog: auto-restart on crash"
+echo "  monitor:  GPU + port monitoring"
+
+sleep 1d
